@@ -6,6 +6,69 @@ const ascii = std.ascii;
 // Removoe later
 const warn = std.debug.warn;
 
+const QuoteTracker = struct {
+    const Self = @This();
+    const QuoteType = enum {
+        Single,
+        Double,
+        // TODO(hazebooth)): multiline
+        // Multiline
+    };
+
+    currentlyWithin: ?QuoteType,
+
+    // TOOD(hazebooth): turn into union
+    const Event = union(enum) {
+        Enter: QuoteType,
+        Exit: QuoteType,
+        None,
+    };
+
+    fn process(self: *Self, source: []const u8, index: usize) Event {
+        const escaped = if (index > 1) source[index - 1] == '\\' else false;
+        // TODO(hazebooth): evaluate naiveness
+        const c = source[index];
+        if (!escaped) {
+            if (c == '"' and !self.inString()) { // start double quote
+                self.currentlyWithin = QuoteType.Double;
+                return Event{ .Enter = self.currentlyWithin.? };
+            } else if (c == '"' and self.isInDoubleQuoteString()) { // end double quote
+                self.currentlyWithin = null;
+                return Event{ .Exit = QuoteType.Double };
+            } else if (c == '\'' and !self.inString()) { // start single quote
+                self.currentlyWithin = QuoteType.Single;
+                return Event{ .Enter = self.currentlyWithin.? };
+            } else if (c == '\'' and self.isInSingleQuoteString()) { // end single quote}
+                self.currentlyWithin = null;
+                return Event{ .Exit = QuoteType.Single };
+            }
+        }
+        return Event.None;
+    }
+
+    fn inString(self: Self) bool {
+        return self.currentlyWithin != null;
+    }
+
+    fn isInStringOfQuoteType(self: Self, ty: QuoteType) bool {
+        return self.inString() and self.currentlyWithin.? == ty;
+    }
+
+    fn isInSingleQuoteString(self: Self) bool {
+        return self.isInStringOfQuoteType(QuoteType.Single);
+    }
+
+    fn isInDoubleQuoteString(self: Self) bool {
+        return self.isInStringOfQuoteType(QuoteType.Double);
+    }
+
+    fn new() Self {
+        return Self{
+            .currentlyWithin = null,
+        };
+    }
+};
+
 pub const StrKV = struct {
     const Self = @This();
 
@@ -29,31 +92,25 @@ pub const Token = union(enum) {
 const State = enum {
     Root,
     Key,
+    QuoteKey,
     Value,
     TableDefinition,
 };
 
 pub const Parser = struct {
     const Self = @This();
-    const QuoteType = enum {
-        Double,
-        Single,
-    };
 
     state: State,
     allocator: *mem.Allocator,
     source: []const u8,
-    inStringQuoteType: ?QuoteType,
 
     index: usize,
     lagIndex: usize,
     processed: usize,
 
-    key: ?[]const u8,
+    quoteTracker: QuoteTracker,
 
-    fn withinString(self: Self) bool {
-        return self.inStringQuoteType != null;
-    }
+    key: ?[]const u8,
 
     pub fn init(allocator: *mem.Allocator, source: []const u8) Parser {
         return Parser{
@@ -62,39 +119,15 @@ pub const Parser = struct {
             .source = source,
             .index = 0,
             .lagIndex = 0,
-            .inStringQuoteType = null,
+            .quoteTracker = QuoteTracker.new(),
             .processed = 0,
             .key = null,
         };
     }
 
     fn setState(self: *Self, state: State) void {
-        warn("{} => {}\n", self.state, state);
+        // warn("{} => {}\n", self.state, state);
         self.state = state;
-    }
-
-    // processQuote makes sure that whenever we encounter a quote
-    // the internal parser state is updated to represent that.
-    // it will not update if we encounter a quote of another type,
-    // or if the quote is escaped.
-    fn processQuote(self: *Self, char: u8) void {
-        if (char == '"') {
-            if (self.inStringQuoteType) |qt| {
-                if (qt == .Double) {
-                    self.inStringQuoteType = null;
-                }
-            } else {
-                self.inStringQuoteType = QuoteType.Double;
-            }
-        } else if (char == '\'') {
-            if (self.inStringQuoteType) |qt| {
-                if (qt == .Single) {
-                    self.inStringQuoteType = null;
-                }
-            } else {
-                self.inStringQuoteType = QuoteType.Single;
-            }
-        }
     }
 
     // skipToNewline will jump over everything from where it was
@@ -102,10 +135,10 @@ pub const Parser = struct {
     // to the end of the source
     fn skipToNewline(self: *Self) void {
         if (mem.indexOfScalar(u8, self.source[self.index..], '\n')) |newLineIndex| {
-            warn("nl comment jump\n");
+            // warn("nl comment jump\n");
             self.index += newLineIndex + 1;
         } else {
-            warn("eof comment jump\n");
+            // warn("eof comment jump\n");
             self.index = self.source.len;
         }
         self.lagIndex = self.index;
@@ -122,51 +155,67 @@ pub const Parser = struct {
         const isComment = char == '#';
 
         const eof = self.index == self.source.len - 1;
-        const isEscaped = b: {
-            if (self.index > 1) {
-                break :b self.source[self.index - 1] == '\\';
-            } else break :b false;
-        };
-        if (!isEscaped) self.processQuote(char);
-        if (isNewline) {
-            warn("on <newline> ({})\n", self.index);
-        } else warn("on {c} ({})\n", char, self.index);
+        // const isEscaped = if (self.index > 1) self.source[self.index - 1] == '\\' else false;
+        // if (!isEscaped) self.processQuote(char);
+        const quoteEvent = self.quoteTracker.process(self.source, self.index);
+        // if (isNewline) {
+        //     warn("on <newline> ({})\n", self.index);
+        // } else warn("on {c} ({})\n", char, self.index);
         switch (self.state) {
             // we are at the default state,
             .Root => {
-                if (char == '[') {
-                    self.setState(.TableDefinition);
-                } else if (ascii.isSpace(char)) {
-                    // cont
-                } else if (isComment) {
-                    // we hit a comment, skip to next line
-                    self.skipToNewline();
-                } else if (isValidKeyChar(char)) {
-                    self.setState(.Key);
-                } else return error.UnexpectedCharacter;
+                // whitespace can exist
+                switch (quoteEvent) {
+                    .Enter => {
+                        self.setState(.QuoteKey);
+                    },
+                    else => {
+                        if (char == '[') {
+                            self.setState(.TableDefinition);
+                        } else if (ascii.isSpace(char)) {
+                            // cont
+                        } else if (isComment) {
+                            // we hit a comment, skip to next line
+                            self.skipToNewline();
+                        } else if (isValidKeyChar(char)) {
+                            self.setState(.Key);
+                        } else return error.UnexpectedCharacter;
+                    },
+                }
+            },
+            .QuoteKey => {
+                switch (quoteEvent) {
+                    .Exit => {
+                        self.setState(.Key);
+                    },
+                    .Enter => unreachable,
+                    .None => {},
+                }
             },
             .Key => {
                 if (char == '=') {
                     self.key = self.source[self.lagIndex..self.index];
                     self.lagIndex = self.index;
                     self.setState(.Value);
-                } else if (!isValidKeyChar(char)) {
-                    warn("bad char: [{c}]\n", char);
-                    return error.UnexpectedCharacter;
-                }
+                } else if (!isValidKeyChar(char)) return error.UnexpectedCharacter;
             },
             .Value => {
-                if (isNewline or (!self.withinString() and isComment) or eof) {
+                if (isNewline or (!self.quoteTracker.inString() and isComment) or eof) {
                     if (self.key) |k| {
                         const end = b: {
                             if (isNewline or isComment) {
                                 break :b self.index;
                             } else break :b self.index + 1;
                         };
+                        const value = self.source[self.lagIndex + 1 .. end];
+                        const strippedKey = stripWhitespace(k);
+                        if (strippedKey.len == 0) return error.BadKey;
+                        const strippedValue = stripWhitespace(value);
+                        if (!isValidValue(strippedValue)) return error.BadValue;
                         const token = Token{
                             .KeyValue = StrKV{
-                                .key = stripWhitespace(k),
-                                .value = stripWhitespace(self.source[self.lagIndex + 1 .. end]),
+                                .key = strippedKey,
+                                .value = strippedValue,
                             },
                         };
                         try tokens.append(token);
@@ -218,5 +267,47 @@ fn stripWhitespace(source: []const u8) []const u8 {
 }
 // solely for parsing
 fn isValidKeyChar(char: u8) bool {
-    return ascii.isAlpha(char) or char == '_' or char == '-' or char == '"' or char == '\'' or char == ' ';
+    const isDash = char == '_' or char == '-';
+    const isQuote = char == '"' or char == '\'';
+    return ascii.isSpace(char) or ascii.isAlpha(char) or ascii.isDigit(char) or isDash or isQuote;
+}
+
+fn isValidValueString(value: []const u8) bool {
+    // if the first char isnt a quote
+    if (value[0] != '"' and value[0] != '\'') return false;
+    if (value[0] == '"' and value[value.len - 1] != '"') return false;
+    if (value[0] == '\'' and value[value.len - 1] != '\'') return false;
+    // fast path over, iteratre and maintain stack to make sure
+
+    var level: usize = 0;
+    var n: usize = 0;
+    var t = QuoteTracker.new();
+    var enteredString = false;
+    while (n < value.len) : (n += 1) {
+        const ev = t.process(value, n);
+        switch (ev) {
+            .Enter => {
+                if (enteredString) unreachable; // cant enter string while entered
+                enteredString = true;
+            },
+            .Exit => {
+                if (enteredString) {
+                    // we should exit the string at the end of the value
+                    // TODO(hazebooth): support multiline
+                    return n == (value.len - 1);
+                } else unreachable;
+            },
+            .None => {}, // do nothing
+        }
+    }
+    return false;
+}
+
+fn isValidValueBoolean(value: []const u8) bool {
+    return ascii.eqlIgnoreCase(value, "true") or ascii.eqlIgnoreCase(value, "false");
+}
+
+fn isValidValue(value: []const u8) bool {
+    const empty = value.len == 0;
+    return !empty and (isValidValueString(value) or isValidValueBoolean(value));
 }
