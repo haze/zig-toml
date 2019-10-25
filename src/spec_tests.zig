@@ -1,5 +1,6 @@
 const std = @import("std");
 const toml = @import("toml.zig");
+const mem = std.mem;
 const t = std.testing;
 
 const warn = std.debug.warn;
@@ -10,7 +11,7 @@ fn printTokens(tokens: []toml.Token) void {
     for (tokens) |token| {
         switch (token) {
             .TableDefinition => |tableName| warn("[{}]\n", tableName),
-            .KeyValue => |kv| warn("KV{{{} equals {}}}\n", kv.key, kv.value),
+            .KeyValue => |kv| warn("KV{{{} = {}}}\n", kv.key, kv.value),
         }
     }
 }
@@ -90,4 +91,44 @@ test "Keys" {
     t.expect(quotedKeysTokens[2].KeyValue.eqlBare(quoted("ʎǝʞ"), quoted("value")));
     t.expect(quotedKeysTokens[3].KeyValue.eqlBare(singleQuoted("key2"), quoted("value")));
     t.expect(quotedKeysTokens[4].KeyValue.eqlBare(singleQuoted("quoted \"value\""), quoted("value")));
+
+    // invalid bare keys
+    const invalidBareKeys =
+        \\= "no key name"  # INVALID
+    ;
+    t.expectError(error.UnexpectedCharacter, tokensFor(GA, invalidBareKeys));
+
+    const validBareKeys =
+        \\"" = "blank"     # VALID but discouraged
+        \\'' = 'blank'     # VALID but discouraged
+    ;
+    const validBareKeyTokens = try tokensFor(GA, validBareKeys);
+    t.expect(validBareKeyTokens[0].KeyValue.eqlBare(quoted(""), quoted("blank")));
+    t.expect(validBareKeyTokens[1].KeyValue.eqlBare(singleQuoted(""), singleQuoted("blank")));
+
+    // dotted keys
+
+    const dottedKeys =
+        \\name = "Orange"
+        \\physical.color = "orange"
+        \\physical.shape = "round"
+        \\site."google.com" = true
+    ;
+    const dottedKeyTokens = try tokensFor(GA, dottedKeys);
+    t.expect(dottedKeyTokens[0].KeyValue.eqlBare("name", quoted("Orange")));
+    t.expect(dottedKeyTokens[1].KeyValue.eqlBare("physical.color", quoted("orange")));
+    t.expect(dottedKeyTokens[2].KeyValue.eqlBare("physical.shape", quoted("round")));
+    t.expect(dottedKeyTokens[3].KeyValue.eqlBare("site.\"google.com\"", "true"));
+}
+
+fn expectString(allocator: *mem.Allocator, source: []const u8, key: []const u8, expected: []const u8) !bool {
+    const table = try toml.Parser.parse(allocator, source);
+    switch (table.get(key).?) {
+        .String => |str| return mem.eql(u8, str, expected),
+        else => return false,
+    }
+}
+
+test "String" {
+    t.expect(try expectString(GA, "foo = 'im a string!' #comment", "foo", singleQuoted("im a string!")));
 }

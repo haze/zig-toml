@@ -6,6 +6,8 @@ const ascii = std.ascii;
 // Removoe later
 const warn = std.debug.warn;
 
+const dbg = false;
+
 const QuoteTracker = struct {
     const Self = @This();
     const QuoteType = enum {
@@ -89,12 +91,116 @@ pub const Token = union(enum) {
     KeyValue: StrKV,
 };
 
-const State = enum {
+const State = union(enum) {
     Root,
     Key,
-    QuoteKey,
+    QuoteKey: QuoteTracker.QuoteType,
     Value,
     TableDefinition,
+};
+
+pub const Value = union(enum) {
+    Array: []Value,
+    String: []const u8,
+    Integer: i64,
+    Float: f64,
+    Boolean: bool,
+    SubTable: Table,
+
+    // TODO(hazebooth): unicode replacements, etc
+    fn fromString(str: []const u8) Value {
+        return Value{ .String = str };
+    }
+
+    // TODO(hazebooth): this will only get here if true or false
+    // remove assumption
+    fn fromBoolean(str: []const u8) Value {
+        return Value{ .Boolean = ascii.eqlIgnoreCase(str, "true") };
+    }
+
+    pub fn from(str: []const u8) !Value {
+        if (isValidValueString(str)) {
+            return Value.fromString(str);
+        } else if (isValidValueBoolean(str)) {
+            return Value.fromBoolean(str);
+        }
+        return error.BadValue;
+    }
+};
+
+pub const Table = struct {
+    const ValueMap = std.StringHashMap(Value);
+    const Self = @This();
+
+    space: ValueMap,
+    name: ?[]const u8,
+    allocator: *mem.Allocator,
+
+    fn newRoot(allocator: *mem.Allocator) Table {
+        return Table{
+            .space = ValueMap.init(allocator),
+            .name = null,
+            .allocator = allocator,
+        };
+    }
+
+    fn newNamed(allocator: *mem.Allocator, name: ?[]const u8) Table {
+        return Table{
+            .space = ValueMap.init(allocator),
+            .name = name,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn get(self: Self, key: []const u8) ?Value {
+        return self.space.getValue(key);
+    }
+
+    fn put(self: *Self, key: []const u8, value: Value) mem.Allocator.Error!void {
+        if (dbg) warn("{}: put({}, {})\n", self.displayName(), key, value);
+        if (mem.indexOfScalar(u8, key, '.')) |sepIdx| {
+            const rest = key[sepIdx + 1 ..];
+            var table = b: {
+                const tableName = key[0..sepIdx];
+                if (self.space.remove(tableName)) |existingTable| {
+                    switch (existingTable.value) {
+                        .SubTable => |t| break :b t,
+                        else => {},
+                        // else => return error.KeyIsNotATable,
+                    }
+                }
+                break :b Table.newNamed(self.allocator, tableName);
+            };
+            try table.put(rest, value);
+            return self.space.putNoClobber(key, Value{ .SubTable = table });
+        } else {
+            if (dbg) warn("{}: putFinal({}, {})\n", self.displayName(), key, value);
+            return self.space.putNoClobber(key, value);
+        }
+    }
+
+    fn displayName(self: Self) []const u8 {
+        return if (self.isRoot()) "root" else self.name.?;
+    }
+
+    fn print(self: Self) void {
+        warn("[{}] ({} items)\n", self.displayName(), self.space.count());
+        var it = self.space.iterator();
+        while (it.next()) |kv| {
+            switch (kv.value) {
+                .SubTable => |t| t.print(),
+                else => |v| warn("{} = {}\n", kv.key, v),
+            }
+        }
+    }
+
+    fn deinit(self: Self) void {
+        self.space.deinit();
+    }
+
+    fn isRoot(self: Self) bool {
+        return self.name == null;
+    }
 };
 
 pub const Parser = struct {
@@ -126,7 +232,7 @@ pub const Parser = struct {
     }
 
     fn setState(self: *Self, state: State) void {
-        // warn("{} => {}\n", self.state, state);
+        if (dbg) warn("{} => {}\n", self.state, state);
         self.state = state;
     }
 
@@ -144,6 +250,19 @@ pub const Parser = struct {
         self.lagIndex = self.index;
     }
 
+    fn processRoot(self: *Self, char: u8, isComment: bool) !void {
+        if (char == '[') {
+            self.setState(.TableDefinition);
+        } else if (ascii.isSpace(char)) {
+            // cont
+        } else if (isComment) {
+            // we hit a comment, skip to next line
+            self.skipToNewline();
+        } else if (isValidKeyChar(char)) {
+            self.setState(.Key);
+        } else return error.UnexpectedCharacter;
+    }
+
     // process increments the index of the parser and transforms the
     // state of the parser if a transition criteria is found.
     // if no transition criteria is found, process will return false to
@@ -158,35 +277,30 @@ pub const Parser = struct {
         // const isEscaped = if (self.index > 1) self.source[self.index - 1] == '\\' else false;
         // if (!isEscaped) self.processQuote(char);
         const quoteEvent = self.quoteTracker.process(self.source, self.index);
-        // if (isNewline) {
-        //     warn("on <newline> ({})\n", self.index);
-        // } else warn("on {c} ({})\n", char, self.index);
+        if (dbg) {
+            if (isNewline) {
+                warn("on <newline> ({})\n", self.index);
+            } else warn("on {c} ({})\n", char, self.index);
+        }
         switch (self.state) {
             // we are at the default state,
             .Root => {
                 // whitespace can exist
                 switch (quoteEvent) {
-                    .Enter => {
-                        self.setState(.QuoteKey);
+                    .Enter => |qt| {
+                        self.setState(State{ .QuoteKey = qt });
                     },
-                    else => {
-                        if (char == '[') {
-                            self.setState(.TableDefinition);
-                        } else if (ascii.isSpace(char)) {
-                            // cont
-                        } else if (isComment) {
-                            // we hit a comment, skip to next line
-                            self.skipToNewline();
-                        } else if (isValidKeyChar(char)) {
-                            self.setState(.Key);
-                        } else return error.UnexpectedCharacter;
-                    },
+                    else => try self.processRoot(char, isComment),
                 }
             },
-            .QuoteKey => {
+            .QuoteKey => |qt| {
                 switch (quoteEvent) {
-                    .Exit => {
+                    .Exit => |eqt| {
                         self.setState(.Key);
+                        // self.key = self.source[self.lagIndex..self.index];
+
+                        // self.lagIndex = self.index;
+                        // self.setState(.Value);
                     },
                     .Enter => unreachable,
                     .None => {},
@@ -197,7 +311,10 @@ pub const Parser = struct {
                     self.key = self.source[self.lagIndex..self.index];
                     self.lagIndex = self.index;
                     self.setState(.Value);
-                } else if (!isValidKeyChar(char)) return error.UnexpectedCharacter;
+                } else if (!isValidKeyChar(char)) {
+                    // warn("bad char: [{c}]\n", char);
+                    return error.UnexpectedCharacter;
+                }
             },
             .Value => {
                 if (isNewline or (!self.quoteTracker.inString() and isComment) or eof) {
@@ -260,6 +377,26 @@ pub const Parser = struct {
         while (try self.process(&tokens)) {}
         return tokens.toOwnedSlice();
     }
+
+    // caller is responsible for freeing the resulting table
+    pub fn parse(allocator: *mem.Allocator, source: []const u8) !Table {
+        var rootTable = Table.newRoot(allocator);
+        var parser = Parser.init(allocator, source);
+        const tokens = try parser.lex();
+        var current = &rootTable;
+        for (tokens) |token| {
+            if (dbg) warn("consuming token {}\n", token);
+            switch (token) {
+                .KeyValue => |kv| try current.put(kv.key, try Value.from(kv.value)),
+                .TableDefinition => |tableName| {
+                    var newTable = Table.newNamed(allocator, tableName);
+                    try rootTable.put(tableName, Value{ .SubTable = newTable });
+                    current = &newTable;
+                },
+            }
+        }
+        return rootTable;
+    }
 };
 
 fn stripWhitespace(source: []const u8) []const u8 {
@@ -267,9 +404,10 @@ fn stripWhitespace(source: []const u8) []const u8 {
 }
 // solely for parsing
 fn isValidKeyChar(char: u8) bool {
+    const isPunct = char == '.';
     const isDash = char == '_' or char == '-';
     const isQuote = char == '"' or char == '\'';
-    return ascii.isSpace(char) or ascii.isAlpha(char) or ascii.isDigit(char) or isDash or isQuote;
+    return ascii.isSpace(char) or ascii.isAlpha(char) or ascii.isDigit(char) or isDash or isQuote or isPunct;
 }
 
 fn isValidValueString(value: []const u8) bool {
