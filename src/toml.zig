@@ -91,10 +91,10 @@ pub const Token = union(enum) {
     KeyValue: StrKV,
 };
 
-const State = union(enum) {
+const State = enum {
     Root,
     Key,
-    QuoteKey: QuoteTracker.QuoteType,
+    QuoteKey,
     Value,
     TableDefinition,
 };
@@ -287,25 +287,16 @@ pub const Parser = struct {
             .Root => {
                 // whitespace can exist
                 switch (quoteEvent) {
-                    .Enter => |qt| {
-                        self.setState(State{ .QuoteKey = qt });
-                    },
+                    .Enter => self.setState(.QuoteKey),
                     else => try self.processRoot(char, isComment),
                 }
             },
-            .QuoteKey => |qt| {
-                switch (quoteEvent) {
-                    .Exit => |eqt| {
-                        self.setState(.Key);
-                        // self.key = self.source[self.lagIndex..self.index];
-
-                        // self.lagIndex = self.index;
-                        // self.setState(.Value);
-                    },
-                    .Enter => unreachable,
-                    .None => {},
-                }
+            .QuoteKey => switch (quoteEvent) {
+                .Exit => self.setState(.Key),
+                .Enter => unreachable,
+                .None => {},
             },
+
             .Key => {
                 if (char == '=') {
                     self.key = self.source[self.lagIndex..self.index];
