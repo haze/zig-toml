@@ -132,3 +132,62 @@ fn expectString(allocator: *mem.Allocator, source: []const u8, key: []const u8, 
 test "String" {
     t.expect(try expectString(GA, "foo = 'im a string!' #comment", "foo", singleQuoted("im a string!")));
 }
+
+fn expectInteger(allocator: *mem.Allocator, source: []const u8, key: []const u8, expected: i64) bool {
+    const table = toml.Parser.parse(allocator, source) catch |err| {
+        std.debug.warn("expected: {}, got: {}\n", expected, err);
+        return false;
+    };
+    switch (table.get(key).?) {
+        .Integer => |i| return i == expected,
+        else => return false,
+    }
+}
+
+test "Integers" {
+    t.expect(expectInteger(GA, "foo=+99 #comment", "foo", 99));
+    t.expect(expectInteger(GA, "foo=42 #comment", "foo", 42));
+    t.expect(expectInteger(GA, "foo=0 #comment", "foo", 0));
+    t.expect(expectInteger(GA, "foo=-17 #comment", "foo", -17));
+    t.expect(expectInteger(GA, "foo=1_000 #comment", "foo", 1000));
+    t.expect(expectInteger(GA, "foo=5_349_221 #comment", "foo", 5349221));
+    t.expect(expectInteger(GA, "foo=1_2_3_4_5 #comment", "foo", 12345));
+    t.expect(expectInteger(GA, "foo=0xDEADBEEF #comment", "foo", 3735928559));
+    t.expect(expectInteger(GA, "foo=0xdeadbeef #comment", "foo", 3735928559));
+    t.expect(expectInteger(GA, "foo=0xdead_beef #comment", "foo", 3735928559));
+    t.expect(expectInteger(GA, "foo=0o01234567 #comment", "foo", 342391));
+    t.expect(expectInteger(GA, "foo=0o755 #comment", "foo", 493));
+    t.expect(expectInteger(GA, "foo=0b11010110 #comment", "foo", 214));
+}
+
+fn expectFloat(allocator: *mem.Allocator, source: []const u8, key: []const u8, expected: f64) bool {
+    const table = toml.Parser.parse(allocator, source) catch |err| {
+        std.debug.warn("expected: {}, got: {}\n", expected, err);
+        return false;
+    };
+    switch (table.get(key).?) {
+        .Float => |f| return f == expected,
+        else => return false,
+    }
+}
+
+fn expectFloatApprox(allocator: *mem.Allocator, source: []const u8, key: []const u8, expected: f64, epsilon: f64) bool {
+    const table = toml.Parser.parse(allocator, source) catch |err| {
+        std.debug.warn("expected: {}, got: {}\n", expected, err);
+        return false;
+    };
+    switch (table.get(key).?) {
+        .Float => |f| return std.math.approxEq(f64, f, expected, epsilon),
+        else => return false,
+    }
+}
+
+test "Floats" {
+    t.expect(expectFloat(GA, "foo=+1.0 #comment", "foo", 1.0));
+    t.expect(expectFloat(GA, "foo=3.1415 #comment", "foo", 3.1415));
+    t.expect(expectFloat(GA, "foo=-0.01 #comment", "foo", -0.01));
+    // t.expect(expectFloatApprox(GA, "foo=-5e+22 #comment", "foo", -5e+22, 0.0000000000000000000001));
+    t.expect(expectFloat(GA, "foo=1e06 #comment", "foo", 1e06));
+    t.expect(expectFloat(GA, "foo=-2E-2 #comment", "foo", -2e-2));
+    t.expect(expectFloat(GA, "foo=6.626e-34 #comment", "foo", 6.626e-34));
+}

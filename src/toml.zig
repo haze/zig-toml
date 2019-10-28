@@ -5,8 +5,27 @@ const ascii = std.ascii;
 
 // Removoe later
 const warn = std.debug.warn;
+const dbg = true;
 
-const dbg = false;
+// caller is responsible for freeing memory
+fn trimUnderscores(allocator: *mem.Allocator, src: []const u8) ![]const u8 {
+    const underscoreCount: usize = b: {
+        var n: usize = 0;
+        for (src) |c| {
+            if (c != '_') n += 1;
+        }
+        break :b n;
+    };
+    const new = try allocator.alloc(u8, underscoreCount);
+    var n: usize = 0;
+    for (src) |c| {
+        if (c != '_') {
+            new[n] = c;
+            n += 1;
+        }
+    }
+    return new;
+}
 
 const QuoteTracker = struct {
     const Self = @This();
@@ -76,6 +95,7 @@ pub const StrKV = struct {
 
     key: []const u8,
     value: []const u8,
+    kind: ValueType,
 
     fn eqlBare(self: Self, key: []const u8, value: []const u8) bool {
         return mem.eql(u8, self.key, key) and mem.eql(u8, self.value, value);
@@ -99,7 +119,16 @@ const State = enum {
     TableDefinition,
 };
 
-pub const Value = union(enum) {
+pub const ValueType = enum {
+    Array,
+    String,
+    Integer,
+    Float,
+    Boolean,
+    SubTable,
+};
+
+pub const Value = union(ValueType) {
     Array: []Value,
     String: []const u8,
     Integer: i64,
@@ -118,13 +147,46 @@ pub const Value = union(enum) {
         return Value{ .Boolean = ascii.eqlIgnoreCase(str, "true") };
     }
 
-    pub fn from(str: []const u8) !Value {
-        if (isValidValueString(str)) {
-            return Value.fromString(str);
-        } else if (isValidValueBoolean(str)) {
-            return Value.fromBoolean(str);
+    fn fromFloat(allocator: *mem.Allocator, str: []const u8) !Value {
+        if (dbg) warn("fromFloat({})\n", str);
+        const withoutUnderscores = try trimUnderscores(allocator, str);
+        errdefer allocator.free(withoutUnderscores);
+        return Value{ .Float = try std.fmt.parseFloat(f64, withoutUnderscores) };
+    }
+
+    fn fromInteger(allocator: *mem.Allocator, str: []const u8) !Value {
+        if (dbg) warn("fromInteger({})\n", str);
+        const withoutUnderscores = try trimUnderscores(allocator, str);
+        errdefer allocator.free(withoutUnderscores);
+        if (withoutUnderscores.len > 2) {
+            const start = withoutUnderscores[0..2];
+            var rest = withoutUnderscores[2..];
+            if (mem.eql(u8, start, "0x")) {
+                return Value{
+                    .Integer = try std.fmt.parseInt(i64, rest, 16),
+                };
+            } else if (mem.eql(u8, start, "0o")) {
+                return Value{
+                    .Integer = try std.fmt.parseInt(i64, rest, 8),
+                };
+            } else if (mem.eql(u8, start, "0b")) {
+                return Value{
+                    .Integer = try std.fmt.parseInt(i64, rest, 2),
+                };
+            }
         }
-        return error.BadValue;
+        return Value{ .Integer = try std.fmt.parseInt(i64, withoutUnderscores, 10) };
+    }
+
+    pub fn from(allocator: *mem.Allocator, kind: ValueType, str: []const u8) !Value {
+        if (dbg) warn("kind: {}, str: {}\n", kind, str);
+        switch (kind) {
+            .Float => return Value.fromFloat(allocator, str),
+            .Integer => return Value.fromInteger(allocator, str),
+            .String => return Value.fromString(str),
+            .Boolean => return Value.fromBoolean(str),
+            else => return Value.fromString("TODO"),
+        }
     }
 };
 
@@ -319,11 +381,12 @@ pub const Parser = struct {
                         const strippedKey = stripWhitespace(k);
                         if (strippedKey.len == 0) return error.BadKey;
                         const strippedValue = stripWhitespace(value);
-                        if (!isValidValue(strippedValue)) return error.BadValue;
+                        const valueGuess = isValidValue(strippedValue) orelse return error.BadValue;
                         const token = Token{
                             .KeyValue = StrKV{
                                 .key = strippedKey,
                                 .value = strippedValue,
+                                .kind = valueGuess,
                             },
                         };
                         try tokens.append(token);
@@ -378,7 +441,7 @@ pub const Parser = struct {
         for (tokens) |token| {
             if (dbg) warn("consuming token {}\n", token);
             switch (token) {
-                .KeyValue => |kv| try current.put(kv.key, try Value.from(kv.value)),
+                .KeyValue => |kv| try current.put(kv.key, try Value.from(allocator, kv.kind, kv.value)),
                 .TableDefinition => |tableName| {
                     var newTable = Table.newNamed(allocator, tableName);
                     try rootTable.put(tableName, Value{ .SubTable = newTable });
@@ -393,12 +456,53 @@ pub const Parser = struct {
 fn stripWhitespace(source: []const u8) []const u8 {
     return mem.trim(u8, source, " ");
 }
+
 // solely for parsing
 fn isValidKeyChar(char: u8) bool {
     const isPunct = char == '.';
     const isDash = char == '_' or char == '-';
     const isQuote = char == '"' or char == '\'';
     return ascii.isSpace(char) or ascii.isAlpha(char) or ascii.isDigit(char) or isDash or isQuote or isPunct;
+}
+
+fn isValidValueInteger(value: []const u8) bool {
+    if (dbg) warn("iVVI: {}\n", value);
+    // trim leading zeroes
+    const trimmed = if (!mem.allEqual(u8, value, '0')) mem.trimLeft(u8, value, "0") else "0";
+    // check every char to make sure its in desired set
+    var okay = true;
+    for (b: {
+        const first = trimmed[0];
+        if (first == '+' or first == '-') {
+            break :b trimmed[1..];
+        } else break :b trimmed;
+    }) |c| {
+        if (dbg) warn("(int) okay={}, c={c}\n", okay, c);
+        okay = okay and (ascii.isXDigit(c) or c == '_' or eqlIgnoreCaseChar(c, 'x') or eqlIgnoreCaseChar(c, 'o') or eqlIgnoreCaseChar(c, 'b'));
+    }
+    return okay;
+}
+
+fn isValidValueFloat(value: []const u8) bool {
+    if (dbg) warn("iVVF: {}\n", value);
+    // trim leading zeroes
+    const trimmed = if (!mem.allEqual(u8, value, '0')) mem.trimLeft(u8, value, "0") else "0";
+    // check every char to make sure its in desired set
+    var okay = true;
+    for (b: {
+        const first = trimmed[0];
+        if (first == '+' or first == '-') {
+            break :b trimmed[1..];
+        } else break :b trimmed;
+    }) |c| {
+        if (dbg) warn("(float) okay={}, c={c}\n", okay, c);
+        okay = okay and (ascii.isXDigit(c) or c == '_' or c == '.' or c == '+' or c == '-');
+    }
+    return okay;
+}
+
+fn eqlIgnoreCaseChar(char: u8, eql: u8) bool {
+    return ascii.eqlIgnoreCase([_]u8{char}, [_]u8{eql});
 }
 
 fn isValidValueString(value: []const u8) bool {
@@ -436,7 +540,19 @@ fn isValidValueBoolean(value: []const u8) bool {
     return ascii.eqlIgnoreCase(value, "true") or ascii.eqlIgnoreCase(value, "false");
 }
 
-fn isValidValue(value: []const u8) bool {
+// returns the best guess for said value for later parsing
+fn isValidValue(value: []const u8) ?ValueType {
     const empty = value.len == 0;
-    return !empty and (isValidValueString(value) or isValidValueBoolean(value));
+    if (!empty) {
+        if (isValidValueString(value)) {
+            return .String;
+        } else if (isValidValueBoolean(value)) {
+            return .Boolean;
+        } else if (isValidValueInteger(value)) {
+            return .Integer;
+        } else if (isValidValueFloat(value)) {
+            return .Float;
+        }
+    }
+    return null;
 }
