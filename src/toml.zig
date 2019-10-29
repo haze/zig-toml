@@ -160,24 +160,20 @@ pub const Value = union(ValueType) {
         if (dbg) warn("fromInteger({})\n", str);
         const withoutUnderscores = try trimUnderscores(allocator, str);
         errdefer allocator.free(withoutUnderscores);
-        if (withoutUnderscores.len > 2) {
-            const start = withoutUnderscores[0..2];
-            var rest = withoutUnderscores[2..];
-            if (mem.eql(u8, start, "0x")) {
-                return Value{
-                    .Integer = try std.fmt.parseInt(i64, rest, 16),
-                };
-            } else if (mem.eql(u8, start, "0o")) {
-                return Value{
-                    .Integer = try std.fmt.parseInt(i64, rest, 8),
-                };
-            } else if (mem.eql(u8, start, "0b")) {
-                return Value{
-                    .Integer = try std.fmt.parseInt(i64, rest, 2),
-                };
-            }
+        switch (IntegerFormat.of(withoutUnderscores)) {
+            .Hex => |v| return Value{
+                .Integer = try std.fmt.parseInt(i64, v, 16),
+            },
+            .Binary => |v| return Value{
+                .Integer = try std.fmt.parseInt(i64, v, 2),
+            },
+            .Octal => |v| return Value{
+                .Integer = try std.fmt.parseInt(i64, v, 8),
+            },
+            .Decimal => return Value{
+                .Integer = try std.fmt.parseInt(i64, withoutUnderscores, 10),
+            },
         }
-        return Value{ .Integer = try std.fmt.parseInt(i64, withoutUnderscores, 10) };
     }
 
     fn fromArray(allocator: *mem.Allocator, str: []const u8) Error!Value {
@@ -503,19 +499,11 @@ fn isValidValueInteger(value: []const u8) bool {
         } else break :b trimmed;
     }) |c| {
         if (dbg) warn("(int) okay={}, c={c}\n", okay, c);
-        const isValidChar = b: {
-            if (value.len > 2) {
-                const start = value[0..2];
-                // abstract out
-                if (ascii.eqlIgnoreCase(start, "0x")) {
-                    break :b ascii.isXDigit(c);
-                } else if (ascii.eqlIgnoreCase(start, "0b")) {
-                    break :b c == '0' or c == '1';
-                } else if (ascii.eqlIgnoreCase(start, "0")) {
-                    break :b c <= '7' and c >= '0';
-                }
-            }
-            break :b ascii.isDigit(c);
+        const isValidChar = switch (IntegerFormat.of(value)) {
+            .Hex => ascii.isXDigit(c),
+            .Binary => c == '0' or c == '1',
+            .Octal => c <= '7' and c >= '0',
+            .Decimal => ascii.isDigit(c),
         };
         // TODO(hazebooth): could be more strict
         okay = okay and (isValidChar or c == '_' or eqlIgnoreCaseChar(c, 'x') or eqlIgnoreCaseChar(c, 'o') or eqlIgnoreCaseChar(c, 'b'));
@@ -606,3 +594,25 @@ fn isValidValue(value: []const u8) ?ValueType {
     }
     return null;
 }
+
+const IntegerFormat = union(enum) {
+    Hex: []const u8,
+    Binary: []const u8,
+    Octal: []const u8,
+    Decimal, // doesn't need further clipping
+
+    fn of(value: []const u8) IntegerFormat {
+        if (value.len > 2) {
+            const start = value[0..2];
+            const rest = value[2..];
+            if (ascii.eqlIgnoreCase(start, "0x")) {
+                return IntegerFormat{ .Hex = rest };
+            } else if (ascii.eqlIgnoreCase(start, "0b")) {
+                return IntegerFormat{ .Binary = rest };
+            } else if (ascii.eqlIgnoreCase(start, "0o")) {
+                return IntegerFormat{ .Octal = rest };
+            }
+        }
+        return .Decimal;
+    }
+};
