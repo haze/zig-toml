@@ -107,8 +107,13 @@ pub const StrKV = struct {
 };
 
 pub const Token = union(enum) {
+    // normal definitions
     TableDefinition: []const u8,
     KeyValue: StrKV,
+
+    // inline tables
+    InlineTableDefinition: []const u8,
+    StopInlineTable,
 };
 
 const State = enum {
@@ -117,6 +122,7 @@ const State = enum {
     QuoteKey,
     Value,
     TableDefinition,
+    InlineTable,
 };
 
 pub const ValueType = enum {
@@ -392,16 +398,66 @@ pub const Parser = struct {
             },
             .Value => {
                 if (isNewline or (!self.quoteTracker.inString() and isComment) or eof) {
-                    if (self.key) |k| {
-                        const end = b: {
-                            if (isNewline or isComment) {
-                                break :b self.index;
-                            } else break :b self.index + 1;
-                        };
-                        const value = self.source[self.lagIndex + 1 .. end];
-                        const strippedKey = stripWhitespace(k);
-                        if (strippedKey.len == 0) return error.BadKey;
-                        const strippedValue = stripWhitespace(value);
+                    const end = b: {
+                        if (isNewline or isComment) {
+                            break :b self.index;
+                        } else break :b self.index + 1;
+                    };
+                    const value = self.source[self.lagIndex + 1 .. end];
+                    const strippedKey = stripWhitespace(self.key.?);
+                    if (strippedKey.len == 0) return error.BadKey;
+                    const strippedValue = stripWhitespace(value);
+                    const valueGuess = isValidValue(strippedValue) orelse return error.BadValue;
+                    const token = Token{
+                        .KeyValue = StrKV{
+                            .key = strippedKey,
+                            .value = strippedValue,
+                            .kind = valueGuess,
+                        },
+                    };
+                    try tokens.append(token);
+                    self.key = null;
+                    self.lagIndex = b: {
+                        if (isNewline or isComment) {
+                            break :b self.index + 1;
+                        }
+                        break :b self.index;
+                    };
+                    // if we hit a comment, we have to push the index
+                    // to the next newline
+                    if (isComment) {
+                        // warn("comment jump window:\n{{{}}}\n", self.source[self.index..]);
+                        if (mem.indexOfScalar(u8, self.source[self.index..], '\n')) |newLineIndex| {
+                            self.index += newLineIndex;
+                            self.lagIndex = self.index + 1;
+                        }
+                    }
+                    self.setState(.Root);
+                } else if (char == '{') {
+                    const strippedKey = stripWhitespace(self.key.?);
+                    try tokens.append(Token{ .InlineTableDefinition = strippedKey });
+                    self.setState(.InlineTable);
+                }
+            },
+            .TableDefinition => {
+                if (char == ']') {
+                    const tableName = self.source[self.lagIndex + 1 .. self.index];
+                    try tokens.append(Token{ .TableDefinition = tableName });
+                    self.lagIndex = self.index;
+                    self.setState(.Root);
+                }
+            },
+            .InlineTable => {
+                const isTableEnd = char == '}';
+                const isSeperator = char == ',';
+                if (!self.quoteTracker.inString() and (isTableEnd or isSeperator or isNewline or eof)) {
+                    const raw = self.source[self.lagIndex + 1 .. self.index];
+                    const rawNoWhitespace = stripWhitespace(raw);
+                    const trimmed = mem.trimLeft(u8, rawNoWhitespace, "{");
+                    const keyValue = stripWhitespace(trimmed);
+                    if (mem.indexOfScalar(u8, keyValue, '=')) |eqIdx| {
+                        const strippedKey = stripWhitespace(keyValue[0..eqIdx]);
+                        const strippedValue = stripWhitespace(keyValue[eqIdx + 1 ..]);
                         const valueGuess = isValidValue(strippedValue) orelse return error.BadValue;
                         const token = Token{
                             .KeyValue = StrKV{
@@ -411,35 +467,12 @@ pub const Parser = struct {
                             },
                         };
                         try tokens.append(token);
-                        self.key = null;
-                        self.lagIndex = b: {
-                            if (isNewline or isComment) {
-                                break :b self.index + 1;
-                            }
-                            break :b self.index;
-                        };
-                        // if we hit a comment, we have to push the index
-                        // to the next newline
-                        if (isComment) {
-                            // warn("comment jump window:\n{{{}}}\n", self.source[self.index..]);
-                            if (mem.indexOfScalar(u8, self.source[self.index..], '\n')) |newLineIndex| {
-                                self.index += newLineIndex;
-                                self.lagIndex = self.index + 1;
-                            }
-                        }
-                        self.setState(.Root);
-                    } else unreachable;
-                }
-                // } else if (!self.withinString() and isComment) {
-                //     self.skipToNewline();
-                // }
-            },
-            .TableDefinition => {
-                if (char == ']') {
-                    const tableName = self.source[self.lagIndex + 1 .. self.index];
-                    try tokens.append(Token{ .TableDefinition = tableName });
+                    }
                     self.lagIndex = self.index;
-                    self.setState(.Root);
+                    if (isNewline or eof) {
+                        try tokens.append(.StopInlineTable);
+                        self.setState(.Root);
+                    }
                 }
             },
         }
@@ -459,15 +492,32 @@ pub const Parser = struct {
         var parser = Parser.init(allocator, source);
         const tokens = try parser.lex();
         var current = &rootTable;
+        var consumingInlineTable: ?Table = null;
         for (tokens) |token| {
             if (dbg) warn("consuming token {}\n", token);
-            switch (token) {
-                .KeyValue => |kv| try current.put(kv.key, try Value.from(allocator, kv.kind, kv.value)),
-                .TableDefinition => |tableName| {
-                    var newTable = Table.newNamed(allocator, tableName);
-                    try rootTable.put(tableName, Value{ .SubTable = newTable });
-                    current = &newTable;
-                },
+            if (consumingInlineTable) |*t| {
+                switch (token) {
+                    .KeyValue => |kv| try t.put(kv.key, try Value.from(allocator, kv.kind, kv.value)),
+                    .StopInlineTable => {
+                        try rootTable.put(t.name.?, Value{ .SubTable = t.* });
+                        consumingInlineTable = null;
+                    },
+                    else => unreachable,
+                }
+            } else {
+                switch (token) {
+                    .KeyValue => |kv| try current.put(kv.key, try Value.from(allocator, kv.kind, kv.value)),
+                    .InlineTableDefinition => |tableName| {
+                        var newTable = Table.newNamed(allocator, tableName);
+                        consumingInlineTable = newTable;
+                    },
+                    .TableDefinition => |tableName| {
+                        var newTable = Table.newNamed(allocator, tableName);
+                        try rootTable.put(tableName, Value{ .SubTable = newTable });
+                        current = &newTable;
+                    },
+                    .StopInlineTable => unreachable,
+                }
             }
         }
         return rootTable;

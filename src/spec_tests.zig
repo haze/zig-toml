@@ -244,3 +244,11 @@ test "Arrays" {
     t.expect(expectArray(GA, "foo=[true, false, true, true] #comment", "foo", [_]bool{ true, false, true, true }));
     t.expect(expectArray(GA, "foo=['bruh moment', \"haze booth\"] #comment", "foo", [_][]const u8{ singleQuoted("bruh moment"), quoted("haze booth") }));
 }
+
+test "Inline Table" {
+    const root = try toml.Parser.parse(GA, "name = { first = \"Sir, Haze\", last = \"Booth\", age = 18 }");
+    const inlineTable = root.get("name").?.SubTable;
+    t.expect(mem.eql(u8, inlineTable.get("first").?.String, quoted("Sir, Haze")));
+    t.expect(mem.eql(u8, inlineTable.get("last").?.String, quoted("Booth")));
+    t.expectEqual(inlineTable.get("age").?.Integer, 18);
+}
