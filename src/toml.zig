@@ -5,7 +5,7 @@ const ascii = std.ascii;
 
 // Removoe later
 const warn = std.debug.warn;
-const dbg = true;
+const dbg = false;
 
 // caller is responsible for freeing memory
 fn trimUnderscores(allocator: *mem.Allocator, src: []const u8) ![]const u8 {
@@ -136,6 +136,8 @@ pub const Value = union(ValueType) {
     Boolean: bool,
     SubTable: Table,
 
+    const Error = error{BadValue} || mem.Allocator.Error;
+
     // TODO(hazebooth): unicode replacements, etc
     fn fromString(str: []const u8) Value {
         return Value{ .String = str };
@@ -178,10 +180,33 @@ pub const Value = union(ValueType) {
         return Value{ .Integer = try std.fmt.parseInt(i64, withoutUnderscores, 10) };
     }
 
-    pub fn from(allocator: *mem.Allocator, kind: ValueType, str: []const u8) !Value {
+    fn fromArray(allocator: *mem.Allocator, str: []const u8) Error!Value {
+        var values = std.ArrayList(Value).init(allocator);
+        var n: usize = 1;
+        var lag: usize = 0;
+        while (n < str.len - 1) {
+            const c = str[n];
+            if (dbg) warn("c={{{c}}}, lc={{{c}}}|{{{}}}, n={{{}}} x={{{}}}\n", c, str[lag], lag, n, n == (str.len - 2));
+            const onLast = n == (str.len - 2);
+            if (c == ',' or onLast) {
+                // const start = if (onLast) lag else lag + 1;
+                const end = if (onLast) n + 1 else n;
+                const value = stripWhitespace(str[lag + 1 .. end]);
+                const guess = isValidValue(value) orelse return error.BadValue;
+                if (dbg) warn("value={{{}}}, guess={{{}}}\n", value, guess);
+                try values.append(try Value.from(allocator, guess, value));
+                lag = n;
+            }
+            n += 1;
+        }
+        return Value{ .Array = values.toOwnedSlice() };
+    }
+
+    pub fn from(allocator: *mem.Allocator, kind: ValueType, str: []const u8) Error!Value {
         if (dbg) warn("kind: {}, str: {}\n", kind, str);
         switch (kind) {
             .Float => return Value.fromFloat(allocator, str),
+            .Array => return Value.fromArray(allocator, str),
             .Integer => return Value.fromInteger(allocator, str),
             .String => return Value.fromString(str),
             .Boolean => return Value.fromBoolean(str),
@@ -478,13 +503,32 @@ fn isValidValueInteger(value: []const u8) bool {
         } else break :b trimmed;
     }) |c| {
         if (dbg) warn("(int) okay={}, c={c}\n", okay, c);
-        okay = okay and (ascii.isXDigit(c) or c == '_' or eqlIgnoreCaseChar(c, 'x') or eqlIgnoreCaseChar(c, 'o') or eqlIgnoreCaseChar(c, 'b'));
+        const isValidChar = b: {
+            if (value.len > 2) {
+                const start = value[0..2];
+                // abstract out
+                if (ascii.eqlIgnoreCase(start, "0x")) {
+                    break :b ascii.isXDigit(c);
+                } else if (ascii.eqlIgnoreCase(start, "0b")) {
+                    break :b c == '0' or c == '1';
+                } else if (ascii.eqlIgnoreCase(start, "0")) {
+                    break :b c <= '7' and c >= '0';
+                }
+            }
+            break :b ascii.isDigit(c);
+        };
+        // TODO(hazebooth): could be more strict
+        okay = okay and (isValidChar or c == '_' or eqlIgnoreCaseChar(c, 'x') or eqlIgnoreCaseChar(c, 'o') or eqlIgnoreCaseChar(c, 'b'));
     }
     return okay;
 }
 
 fn isValidValueFloat(value: []const u8) bool {
     if (dbg) warn("iVVF: {}\n", value);
+    // fast path, check if there is a '.' or 'e'
+    if (mem.indexOf(u8, value, ".e") != null) {
+        return false;
+    }
     // trim leading zeroes
     const trimmed = if (!mem.allEqual(u8, value, '0')) mem.trimLeft(u8, value, "0") else "0";
     // check every char to make sure its in desired set
@@ -540,11 +584,17 @@ fn isValidValueBoolean(value: []const u8) bool {
     return ascii.eqlIgnoreCase(value, "true") or ascii.eqlIgnoreCase(value, "false");
 }
 
+fn isValidValueArray(value: []const u8) bool {
+    return value[0] == '[' and value[value.len - 1] == ']';
+}
+
 // returns the best guess for said value for later parsing
 fn isValidValue(value: []const u8) ?ValueType {
     const empty = value.len == 0;
     if (!empty) {
-        if (isValidValueString(value)) {
+        if (isValidValueArray(value)) {
+            return .Array;
+        } else if (isValidValueString(value)) {
             return .String;
         } else if (isValidValueBoolean(value)) {
             return .Boolean;

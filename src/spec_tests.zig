@@ -191,3 +191,56 @@ test "Floats" {
     t.expect(expectFloat(GA, "foo=-2E-2 #comment", "foo", -2e-2));
     t.expect(expectFloat(GA, "foo=6.626e-34 #comment", "foo", 6.626e-34));
 }
+
+fn expectBoolean(allocator: *mem.Allocator, source: []const u8, key: []const u8, expected: bool) bool {
+    const table = toml.Parser.parse(allocator, source) catch |err| {
+        std.debug.warn("expected: {}, got: {}\n", expected, err);
+        return false;
+    };
+    switch (table.get(key).?) {
+        .Boolean => |b| return b == expected,
+        else => return false,
+    }
+}
+
+test "Boolean" {
+    t.expect(expectBoolean(GA, "foo=true #comment", "foo", true));
+    t.expect(expectBoolean(GA, "foo=false #comment", "foo", false));
+}
+
+fn expectArray(allocator: *mem.Allocator, source: []const u8, key: []const u8, expected: var) bool {
+    const table = toml.Parser.parse(allocator, source) catch |err| {
+        std.debug.warn("expected: {}, got: {}\n", expected, err);
+        return false;
+    };
+    const ty = @typeOf(expected);
+    if (@typeInfo(ty) != .Array) @compileError("expectArray requires an Array type");
+    const concreteType = @typeInfo(ty).Array.child;
+    switch (table.get(key).?) {
+        .Array => |arr| {
+            if (concreteType == i64) { // array of ints
+                for (arr) |v, i| {
+                    if (v.Integer != expected[i]) return false;
+                }
+            } else if (concreteType == bool) {
+                for (arr) |v, i| {
+                    if (v.Boolean != expected[i]) return false;
+                }
+            } else if (concreteType == []const u8) {
+                for (arr) |v, i| {
+                    if (!mem.eql(u8, v.String, expected[i])) return false;
+                }
+            } else {
+                @compileError("expectArray does not support type " ++ @typeName(concreteType) ++ " yet");
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+test "Arrays" {
+    t.expect(expectArray(GA, "foo=[1, 2, 3] #comment", "foo", [_]i64{ 1, 2, 3 }));
+    t.expect(expectArray(GA, "foo=[true, false, true, true] #comment", "foo", [_]bool{ true, false, true, true }));
+    t.expect(expectArray(GA, "foo=['bruh moment', \"haze booth\"] #comment", "foo", [_][]const u8{ singleQuoted("bruh moment"), quoted("haze booth") }));
+}
