@@ -226,7 +226,6 @@ pub const Table = struct {
     const Self = @This();
 
     space: ValueMap,
-    subTables: std.ArrayList(Table),
     name: ?[]const u8,
     allocator: *mem.Allocator,
 
@@ -235,7 +234,6 @@ pub const Table = struct {
             .space = ValueMap.init(allocator),
             .name = null,
             .allocator = allocator,
-            .subTables = std.ArrayList(Table).init(allocator),
         };
     }
 
@@ -244,7 +242,6 @@ pub const Table = struct {
             .space = ValueMap.init(allocator),
             .name = name,
             .allocator = allocator,
-            .subTables = std.ArrayList(Table).init(allocator),
         };
     }
 
@@ -254,10 +251,6 @@ pub const Table = struct {
 
     pub fn count(self: Self) usize {
         return self.space.count();
-    }
-
-    fn addSubTable(self: *Self, subTable: Table) !void {
-        return self.subTables.append(subTable);
     }
 
     fn put(self: *Self, key: []const u8, value: Value) mem.Allocator.Error!void {
