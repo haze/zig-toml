@@ -114,6 +114,9 @@ pub const Token = union(enum) {
     // inline tables
     InlineTableDefinition: []const u8,
     StopInlineTable,
+
+    // table array
+    TableArrayDefinition: []const u8,
 };
 
 const State = enum {
@@ -123,6 +126,7 @@ const State = enum {
     Value,
     TableDefinition,
     InlineTable,
+    TableArrayDefinition,
 };
 
 pub const ValueType = enum {
@@ -222,6 +226,7 @@ pub const Table = struct {
     const Self = @This();
 
     space: ValueMap,
+    subTables: std.ArrayList(Table),
     name: ?[]const u8,
     allocator: *mem.Allocator,
 
@@ -230,6 +235,7 @@ pub const Table = struct {
             .space = ValueMap.init(allocator),
             .name = null,
             .allocator = allocator,
+            .subTables = std.ArrayList(Table).init(allocator),
         };
     }
 
@@ -238,11 +244,20 @@ pub const Table = struct {
             .space = ValueMap.init(allocator),
             .name = name,
             .allocator = allocator,
+            .subTables = std.ArrayList(Table).init(allocator),
         };
     }
 
     pub fn get(self: Self, key: []const u8) ?Value {
         return self.space.getValue(key);
+    }
+
+    pub fn count(self: Self) usize {
+        return self.space.count();
+    }
+
+    fn addSubTable(self: *Self, subTable: Table) !void {
+        return self.subTables.append(subTable);
     }
 
     fn put(self: *Self, key: []const u8, value: Value) mem.Allocator.Error!void {
@@ -358,6 +373,11 @@ pub const Parser = struct {
     // signal to stop processing.
     fn process(self: *Self, tokens: *std.ArrayList(Token)) !bool {
         const char = self.source[self.index];
+        const before = b: {
+            if (self.index > 1) {
+                break :b self.source[self.index - 1];
+            } else break :b null;
+        };
 
         const isNewline = char == '\n';
         const isComment = char == '#';
@@ -368,8 +388,8 @@ pub const Parser = struct {
         const quoteEvent = self.quoteTracker.process(self.source, self.index);
         if (dbg) {
             if (isNewline) {
-                warn("on <newline> ({})\n", self.index);
-            } else warn("on {c} ({})\n", char, self.index);
+                warn("on <newline> ({}) li={} ({c})\n", self.index, self.lagIndex, self.source[self.lagIndex]);
+            } else warn("on {c} ({}) li={} ({c})\n", char, self.index, self.lagIndex, self.source[self.lagIndex]);
         }
         switch (self.state) {
             // we are at the default state,
@@ -415,6 +435,7 @@ pub const Parser = struct {
                             .kind = valueGuess,
                         },
                     };
+                    if (dbg) warn("Added token: {{{}}}\n", token);
                     try tokens.append(token);
                     self.key = null;
                     self.lagIndex = b: {
@@ -440,11 +461,26 @@ pub const Parser = struct {
                 }
             },
             .TableDefinition => {
-                if (char == ']') {
-                    const tableName = self.source[self.lagIndex + 1 .. self.index];
+                if (char == '[') {
+                    self.setState(.TableArrayDefinition);
+                } else if (char == ']') {
+                    const tableName = stripWhitespace(self.source[self.lagIndex + 1 .. self.index]);
+                    if (dbg) warn("adding table: {{{}}}\n", tableName);
                     try tokens.append(Token{ .TableDefinition = tableName });
                     self.lagIndex = self.index;
                     self.setState(.Root);
+                }
+            },
+            .TableArrayDefinition => {
+                if (before) |charBefore| {
+                    if (char == ']' and charBefore == ']') {
+                        const start = if (self.lagIndex == 0) 0 else self.lagIndex + 1;
+                        const tableName = stripWhitespace(self.source[start .. self.index + 1]);
+                        if (dbg) warn("adding array table: {{{}}}\n", tableName);
+                        try tokens.append(Token{ .TableArrayDefinition = tableName[2 .. tableName.len - 2] });
+                        self.lagIndex = if (self.lagIndex == 0) self.index + 2 else self.index + 1;
+                        self.setState(.Root);
+                    }
                 }
             },
             .InlineTable => {
@@ -486,6 +522,38 @@ pub const Parser = struct {
         return tokens.toOwnedSlice();
     }
 
+    const ArrayTableContext = struct {
+        name: []const u8,
+        tables: std.ArrayList(Value),
+        currentTable: Table,
+        allocator: *mem.Allocator,
+
+        fn init(allocator: *mem.Allocator, rootTable: *Table, name: []const u8) ArrayTableContext {
+            const slice = b: {
+                if (rootTable.space.remove(name)) |t| {
+                    break :b t.value.Array;
+                }
+                break :b [_]Value{};
+            };
+            return ArrayTableContext{
+                .name = name,
+                .tables = std.ArrayList(Value).fromOwnedSlice(allocator, slice),
+                .currentTable = Table.newNamed(allocator, name),
+                .allocator = allocator,
+            };
+        }
+
+        fn another(self: *ArrayTableContext) !void {
+            try self.tables.append(Value{ .SubTable = self.currentTable });
+            self.currentTable = Table.newNamed(self.allocator, self.name);
+        }
+
+        // dumps the entire arraylist of tables as an owned slice
+        fn toValue(self: *ArrayTableContext) Value {
+            return Value{ .Array = self.tables.toOwnedSlice() };
+        }
+    };
+
     // caller is responsible for freeing the resulting table
     pub fn parse(allocator: *mem.Allocator, source: []const u8) !Table {
         var rootTable = Table.newRoot(allocator);
@@ -493,9 +561,28 @@ pub const Parser = struct {
         const tokens = try parser.lex();
         var current = &rootTable;
         var consumingInlineTable: ?Table = null;
+        var tableArrayCtx: ?ArrayTableContext = null;
         for (tokens) |token| {
             if (dbg) warn("consuming token {}\n", token);
-            if (consumingInlineTable) |*t| {
+            if (tableArrayCtx) |*ctx| {
+                switch (token) {
+                    .KeyValue => |kv| try ctx.currentTable.put(kv.key, try Value.from(allocator, kv.kind, kv.value)),
+                    .TableDefinition => |tableName| { // normal table def, go back to normal
+                        try rootTable.put(ctx.name, ctx.toValue());
+                        tableArrayCtx = null;
+                        var newTable = Table.newNamed(allocator, tableName);
+                        try rootTable.put(tableName, Value{ .SubTable = newTable });
+                        current = &newTable;
+                    },
+                    .TableArrayDefinition => |tableName| { // start a new object
+                        try ctx.another();
+                        // try currentTableArray.?.append(Value{ .SubTable = t.* });
+                        // // try rootTable.addSubTable(currentArrayTable.?);
+                        // currentArrayTable = Table.newNamed(allocator, t.name.?);
+                    },
+                    else => unreachable,
+                }
+            } else if (consumingInlineTable) |*t| {
                 switch (token) {
                     .KeyValue => |kv| try t.put(kv.key, try Value.from(allocator, kv.kind, kv.value)),
                     .StopInlineTable => {
@@ -517,15 +604,23 @@ pub const Parser = struct {
                         current = &newTable;
                     },
                     .StopInlineTable => unreachable,
+                    .TableArrayDefinition => |tableName| {
+                        tableArrayCtx = ArrayTableContext.init(allocator, &rootTable, tableName);
+                    },
                 }
             }
+        }
+        if (tableArrayCtx) |*ctx| {
+            try ctx.another();
+            try rootTable.put(ctx.name, ctx.toValue());
+            tableArrayCtx = null;
         }
         return rootTable;
     }
 };
 
 fn stripWhitespace(source: []const u8) []const u8 {
-    return mem.trim(u8, source, " ");
+    return mem.trim(u8, source, " \r\t\n");
 }
 
 // solely for parsing

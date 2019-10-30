@@ -252,3 +252,34 @@ test "Inline Table" {
     t.expect(mem.eql(u8, inlineTable.get("last").?.String, quoted("Booth")));
     t.expectEqual(inlineTable.get("age").?.Integer, 18);
 }
+
+test "Array of Tables" {
+    const file =
+        \\[[products]]
+        \\name = "Hammer"
+        \\sku = 738594937
+        \\  
+        \\[[products]]
+        \\
+        \\[[products]]
+        \\name = "Nail"
+        \\sku = 284758393
+        \\color = "gray"
+    ;
+    const root = try toml.Parser.parse(GA, file);
+    const products = root.get("products").?.Array;
+    t.expectEqual(products.len, 3);
+    const productTableA = products[0].SubTable;
+    const productTableB = products[1].SubTable;
+    const productTableC = products[2].SubTable;
+    t.expectEqual(productTableA.count(), 2);
+    t.expectEqual(productTableB.count(), 0);
+    t.expectEqual(productTableC.count(), 3);
+
+    t.expect(mem.eql(u8, productTableA.get("name").?.String, quoted("Hammer")));
+    t.expectEqual(productTableA.get("sku").?.Integer, 738594937);
+
+    t.expect(mem.eql(u8, productTableC.get("name").?.String, quoted("Nail")));
+    t.expectEqual(productTableC.get("sku").?.Integer, 284758393);
+    t.expect(mem.eql(u8, productTableC.get("color").?.String, quoted("gray")));
+}
