@@ -283,3 +283,13 @@ test "Array of Tables" {
     t.expectEqual(productTableC.get("sku").?.Integer, 284758393);
     t.expect(mem.eql(u8, productTableC.get("color").?.String, quoted("gray")));
 }
+
+test "Multiline Strings" {
+    const multilineStringFile =
+        \\foo = """This is a string
+        \\that spans multiple
+        \\(3 in fact) lines."""
+    ;
+    const table = try toml.Parser.parse(GA, multilineStringFile);
+    t.expectEqual(table.count(), 1);
+}

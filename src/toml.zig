@@ -32,8 +32,8 @@ const QuoteTracker = struct {
     const QuoteType = enum {
         Single,
         Double,
-        // TODO(hazebooth)): multiline
-        // Multiline
+        MultilineSingle,
+        MultilineDouble,
     };
 
     currentlyWithin: ?QuoteType,
@@ -50,16 +50,36 @@ const QuoteTracker = struct {
         // TODO(hazebooth): evaluate naiveness
         const c = source[index];
         if (!escaped) {
-            if (c == '"' and !self.inString()) { // start double quote
+            if (index + 3 <= source.len) {
+                const three = source[index .. index + 3];
+                const isDoubleMultiQuote = mem.eql(u8, three, "\"\"\"");
+                const isSingleMultiQuote = mem.eql(u8, three, "'''");
+                if (isDoubleMultiQuote and !self.inString()) {
+                    self.currentlyWithin = QuoteType.MultilineDouble;
+                    return Event{ .Enter = self.currentlyWithin.? };
+                } else if (isDoubleMultiQuote and self.isInMultiDoubleQuoteString()) {
+                    self.currentlyWithin = null;
+                    return Event{ .Exit = QuoteType.MultilineDouble };
+                } else if (isSingleMultiQuote and !self.inString()) {
+                    self.currentlyWithin = QuoteType.MultilineSingle;
+                    return Event{ .Enter = self.currentlyWithin.? };
+                } else if (isSingleMultiQuote and self.isInMultiSingleQuoteString()) {
+                    self.currentlyWithin = null;
+                    return Event{ .Exit = QuoteType.MultilineSingle };
+                }
+            }
+            const isDoubleQuote = c == '"';
+            const isSingleQuote = c == '\'';
+            if (isDoubleQuote and !self.inString()) { // start double quote
                 self.currentlyWithin = QuoteType.Double;
                 return Event{ .Enter = self.currentlyWithin.? };
-            } else if (c == '"' and self.isInDoubleQuoteString()) { // end double quote
+            } else if (isDoubleQuote and self.isInDoubleQuoteString()) { // end double quote
                 self.currentlyWithin = null;
                 return Event{ .Exit = QuoteType.Double };
-            } else if (c == '\'' and !self.inString()) { // start single quote
+            } else if (isSingleQuote and !self.inString()) { // start single quote
                 self.currentlyWithin = QuoteType.Single;
                 return Event{ .Enter = self.currentlyWithin.? };
-            } else if (c == '\'' and self.isInSingleQuoteString()) { // end single quote}
+            } else if (isSingleQuote and self.isInSingleQuoteString()) { // end single quote}
                 self.currentlyWithin = null;
                 return Event{ .Exit = QuoteType.Single };
             }
@@ -81,6 +101,14 @@ const QuoteTracker = struct {
 
     fn isInDoubleQuoteString(self: Self) bool {
         return self.isInStringOfQuoteType(QuoteType.Double);
+    }
+
+    fn isInMultiDoubleQuoteString(self: Self) bool {
+        return self.isInStringOfQuoteType(QuoteType.MultilineDouble);
+    }
+
+    fn isInMultiSingleQuoteString(self: Self) bool {
+        return self.isInStringOfQuoteType(QuoteType.MultilineSingle);
     }
 
     fn new() Self {
@@ -351,6 +379,7 @@ pub const Parser = struct {
         if (char == '[') {
             self.setState(.TableDefinition);
         } else if (ascii.isSpace(char)) {
+
             // cont
         } else if (isComment) {
             // we hit a comment, skip to next line
@@ -365,6 +394,22 @@ pub const Parser = struct {
     // if no transition criteria is found, process will return false to
     // signal to stop processing.
     fn process(self: *Self, tokens: *std.ArrayList(Token)) !bool {
+        // const isEscaped = if (self.index > 1) self.source[self.index - 1] == '\\' else false;
+        // if (!isEscaped) self.processQuote(char);
+        const quoteEvent = self.quoteTracker.process(self.source, self.index);
+        switch (quoteEvent) {
+            .Exit => |ty| {
+                if (ty == .MultilineDouble or ty == .MultilineSingle) { // we just left a triple string, so jump +3
+                    self.index += 2;
+                }
+            },
+            .Enter => |ty| {
+                if (ty == .MultilineDouble or ty == .MultilineSingle) { // we just entered a triple string, so jump +3
+                    self.index += 2;
+                }
+            },
+            else => {},
+        }
         const char = self.source[self.index];
         const before = b: {
             if (self.index > 1) {
@@ -376,13 +421,11 @@ pub const Parser = struct {
         const isComment = char == '#';
 
         const eof = self.index == self.source.len - 1;
-        // const isEscaped = if (self.index > 1) self.source[self.index - 1] == '\\' else false;
-        // if (!isEscaped) self.processQuote(char);
-        const quoteEvent = self.quoteTracker.process(self.source, self.index);
         if (dbg) {
+            if (quoteEvent != .None) warn("quoteEvent: {}\n", quoteEvent);
             if (isNewline) {
-                warn("on <newline> ({}) li={} ({c})\n", self.index, self.lagIndex, self.source[self.lagIndex]);
-            } else warn("on {c} ({}) li={} ({c})\n", char, self.index, self.lagIndex, self.source[self.lagIndex]);
+                warn("on <newline> (i={}) li={} ({c})\n", self.index, self.lagIndex, self.source[self.lagIndex]);
+            } else warn("on {c} (i={}) li={} ({c})\n", char, self.index, self.lagIndex, self.source[self.lagIndex]);
         }
         switch (self.state) {
             // we are at the default state,
@@ -410,7 +453,7 @@ pub const Parser = struct {
                 }
             },
             .Value => {
-                if (isNewline or (!self.quoteTracker.inString() and isComment) or eof) {
+                if ((!self.quoteTracker.inString() and (isNewline or isComment)) or eof) {
                     const end = b: {
                         if (isNewline or isComment) {
                             break :b self.index;
@@ -693,10 +736,12 @@ fn isValidValueString(value: []const u8) bool {
                 if (enteredString) unreachable; // cant enter string while entered
                 enteredString = true;
             },
-            .Exit => {
+            .Exit => |ty| {
                 if (enteredString) {
                     // we should exit the string at the end of the value
-                    // TODO(hazebooth): support multiline
+                    if (ty == .MultilineSingle or ty == .MultilineDouble) {
+                        return n == (value.len - 3);
+                    }
                     return n == (value.len - 1);
                 } else unreachable;
             },
