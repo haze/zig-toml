@@ -170,6 +170,17 @@ pub const ValueType = enum {
     SubTable,
 };
 
+fn addCodepointToBuffer(codepointStr: []const u8, buf: *std.Buffer) !void {
+    const codepoint = std.fmt.parseInt(u32, codepointStr, 16) catch return error.BadValue;
+    if (dbg) warn("codepoint = {{{}}}\n", codepoint);
+    // grow the buffer by the codepoint size
+    const codepointSize = std.unicode.utf8CodepointSequenceLength(codepoint) catch return error.BadValue;
+    const oldBufLen = buf.len();
+    const newSize = oldBufLen + codepointSize;
+    try buf.resize(newSize);
+    _ = std.unicode.utf8Encode(codepoint, buf.toSlice()[oldBufLen..]) catch return error.BadValue;
+}
+
 pub const Value = union(ValueType) {
     Array: []Value,
     String: []const u8,
@@ -180,13 +191,50 @@ pub const Value = union(ValueType) {
 
     const Error = error{BadValue} || mem.Allocator.Error;
 
-    // TODO(hazebooth): unicode replacements, etc
-    fn fromString(str: []const u8) Value {
-        return Value{ .String = str };
+    fn fromString(allocator: *mem.Allocator, str: []const u8) Error!Value {
+        // can be at most str size
+        if (mem.indexOfScalar(u8, str, '\\') == null) { // if we dont find any escaped char
+            return Value{ .String = str };
+        }
+        // var new = try allocator.alloc(u8, str.len);
+        //  TODO(hazebooth): find a way to use a buffer while still being able to edit
+        // existing parts
+        var buf = try std.Buffer.initSize(allocator, 0);
+        var srcPtr: usize = 0;
+        while (srcPtr < str.len) {
+            const c = str[srcPtr];
+            if (c == '\\') { // dont increment
+                const lookAhead = if (srcPtr + 1 > str.len) return error.BadValue else str[srcPtr + 1];
+                switch (lookAhead) {
+                    'b' => try buf.appendByte('\u{0008}'),
+                    'f' => try buf.appendByte('\u{000C}'),
+                    't' => try buf.appendByte('\t'),
+                    'n' => try buf.appendByte('\n'),
+                    'r' => try buf.appendByte('\r'),
+                    'U' => {
+                        // +2 = \U
+                        const codepointStr = str[srcPtr + 2 .. srcPtr + 10];
+                        try addCodepointToBuffer(codepointStr, &buf);
+                        srcPtr += 8;
+                    },
+                    'u' => {
+                        const codepointStr = str[srcPtr + 2 .. srcPtr + 6];
+                        try addCodepointToBuffer(codepointStr, &buf);
+                        srcPtr += 4;
+                    },
+                    else => return error.BadValue,
+                }
+                // did successful replacement, increment src
+                srcPtr += 1;
+            } else {
+                try buf.appendByte(c);
+            }
+            srcPtr += 1;
+        }
+        if (dbg) warn("final={{{}}}\n", buf.toSliceConst());
+        return Value{ .String = buf.toOwnedSlice() };
     }
 
-    // TODO(hazebooth): this will only get here if true or false
-    // remove assumption
     fn fromBoolean(str: []const u8) Value {
         return Value{ .Boolean = ascii.eqlIgnoreCase(str, "true") };
     }
@@ -227,7 +275,6 @@ pub const Value = union(ValueType) {
             if (dbg) warn("c={{{c}}}, lc={{{c}}}|{{{}}}, n={{{}}} x={{{}}}\n", c, str[lag], lag, n, n == (str.len - 2));
             const onLast = n == (str.len - 2);
             if (c == ',' or onLast) {
-                // const start = if (onLast) lag else lag + 1;
                 const end = if (onLast) n + 1 else n;
                 const value = stripWhitespace(str[lag + 1 .. end]);
                 const guess = isValidValue(value) orelse return error.BadValue;
@@ -246,9 +293,9 @@ pub const Value = union(ValueType) {
             .Float => return Value.fromFloat(allocator, str),
             .Array => return Value.fromArray(allocator, str),
             .Integer => return Value.fromInteger(allocator, str),
-            .String => return Value.fromString(str),
+            .String => return Value.fromString(allocator, str),
             .Boolean => return Value.fromBoolean(str),
-            else => return Value.fromString("TODO"),
+            else => return error.BadValue,
         }
     }
 };
@@ -694,7 +741,6 @@ fn isValidValueInteger(value: []const u8) bool {
             .Octal => c <= '7' and c >= '0',
             .Decimal => ascii.isDigit(c),
         };
-        // TODO(hazebooth): could be more strict
         if (!isValidChar and c != '_') return false;
     }
     return true;

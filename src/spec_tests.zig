@@ -293,3 +293,9 @@ test "Multiline Strings" {
     const table = try toml.Parser.parse(GA, multilineStringFile);
     t.expectEqual(table.count(), 1);
 }
+
+test "Unicode Replacements" {
+    t.expect(try expectString(GA, "foo = '\\n' #comment", "foo", singleQuoted("\n")));
+    t.expect(try expectString(GA, "foo = '\\u50b7' #comment", "foo", singleQuoted("傷")));
+    t.expect(try expectString(GA, "foo = '\\U000050b7' #comment", "foo", singleQuoted("傷")));
+}
