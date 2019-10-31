@@ -34,6 +34,10 @@ const QuoteTracker = struct {
         Double,
         MultilineSingle,
         MultilineDouble,
+
+        fn isMultiline(self: QuoteType) bool {
+            return self == .MultilineDouble or self == .MultilineSingle;
+        }
     };
 
     currentlyWithin: ?QuoteType,
@@ -399,12 +403,12 @@ pub const Parser = struct {
         const quoteEvent = self.quoteTracker.process(self.source, self.index);
         switch (quoteEvent) {
             .Exit => |ty| {
-                if (ty == .MultilineDouble or ty == .MultilineSingle) { // we just left a triple string, so jump +3
+                if (ty.isMultiline()) { // we just left a triple string, so jump +3
                     self.index += 2;
                 }
             },
             .Enter => |ty| {
-                if (ty == .MultilineDouble or ty == .MultilineSingle) { // we just entered a triple string, so jump +3
+                if (ty.isMultiline()) { // we just entered a triple string, so jump +3
                     self.index += 2;
                 }
             },
@@ -672,14 +676,18 @@ fn isValidValueInteger(value: []const u8) bool {
     // trim leading zeroes
     const trimmed = if (!mem.allEqual(u8, value, '0')) mem.trimLeft(u8, value, "0") else "0";
     // check every char to make sure its in desired set
-    var okay = true;
+    const format = IntegerFormat.of(value);
+    const clean = switch (format) {
+        .Hex, .Binary, .Octal => |clean| clean,
+        .Decimal => value,
+    };
     for (b: {
-        const first = trimmed[0];
+        const first = clean[0];
         if (first == '+' or first == '-') {
-            break :b trimmed[1..];
-        } else break :b trimmed;
+            break :b clean[1..];
+        } else break :b clean;
     }) |c| {
-        if (dbg) warn("(int) okay={}, c={c}\n", okay, c);
+        if (dbg) warn("(int) c={c}\n", c);
         const isValidChar = switch (IntegerFormat.of(value)) {
             .Hex => ascii.isXDigit(c),
             .Binary => c == '0' or c == '1',
@@ -687,31 +695,32 @@ fn isValidValueInteger(value: []const u8) bool {
             .Decimal => ascii.isDigit(c),
         };
         // TODO(hazebooth): could be more strict
-        okay = okay and (isValidChar or c == '_' or eqlIgnoreCaseChar(c, 'x') or eqlIgnoreCaseChar(c, 'o') or eqlIgnoreCaseChar(c, 'b'));
+        if (!isValidChar and c != '_') return false;
     }
-    return okay;
+    return true;
 }
 
 fn isValidValueFloat(value: []const u8) bool {
     if (dbg) warn("iVVF: {}\n", value);
     // fast path, check if there is a '.' or 'e'
-    if (mem.indexOf(u8, value, ".e") != null) {
+    if (mem.indexOfAny(u8, value, ".eE") == null) {
         return false;
     }
     // trim leading zeroes
     const trimmed = if (!mem.allEqual(u8, value, '0')) mem.trimLeft(u8, value, "0") else "0";
     // check every char to make sure its in desired set
-    var okay = true;
     for (b: {
         const first = trimmed[0];
         if (first == '+' or first == '-') {
             break :b trimmed[1..];
         } else break :b trimmed;
     }) |c| {
-        if (dbg) warn("(float) okay={}, c={c}\n", okay, c);
-        okay = okay and (ascii.isXDigit(c) or c == '_' or c == '.' or c == '+' or c == '-');
+        if (dbg) warn("(int) c={c}\n", c);
+        const isPunct = c == '_' or c == '.';
+        const isSign = c == '+' or c == '-';
+        if (!ascii.isDigit(c) and !isPunct and !isSign and !eqlIgnoreCaseChar(c, 'e')) return false;
     }
-    return okay;
+    return true;
 }
 
 fn eqlIgnoreCaseChar(char: u8, eql: u8) bool {
@@ -739,7 +748,7 @@ fn isValidValueString(value: []const u8) bool {
             .Exit => |ty| {
                 if (enteredString) {
                     // we should exit the string at the end of the value
-                    if (ty == .MultilineSingle or ty == .MultilineDouble) {
+                    if (ty.isMultiline()) {
                         return n == (value.len - 3);
                     }
                     return n == (value.len - 1);
@@ -752,6 +761,7 @@ fn isValidValueString(value: []const u8) bool {
 }
 
 fn isValidValueBoolean(value: []const u8) bool {
+    if (value.len > 5 or value.len < 4) return false;
     return ascii.eqlIgnoreCase(value, "true") or ascii.eqlIgnoreCase(value, "false");
 }
 
