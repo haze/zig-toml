@@ -1,0 +1,3 @@
+[submodule "zig-bench"]
+	path = zig-bench
+	url = https://github.com/Hejsil/zig-bench
