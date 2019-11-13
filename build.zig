@@ -10,7 +10,7 @@ pub fn build(b: *Builder) void {
     // var main_tests = b.addTest("src/toml.zig");
     // main_tests.setBuildMode(mode);
 
-    var spec_tests = b.addTest("src/spec_tests.zig");
+    var spec_tests = b.addTest("src/test.zig");
     spec_tests.setBuildMode(mode);
 
     var benchmark = b.addTest("src/bench.zig");

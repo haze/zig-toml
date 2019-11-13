@@ -5,7 +5,7 @@ const ascii = std.ascii;
 
 // Removoe later
 const warn = std.debug.warn;
-const dbg = true;
+const dbg = false;
 
 // caller is responsible for freeing memory
 fn trimUnderscores(allocator: *mem.Allocator, src: []const u8) ![]const u8 {
@@ -189,10 +189,29 @@ pub const Value = union(ValueType) {
 
     const Error = error{BadValue} || mem.Allocator.Error;
 
+    fn string(self: Value, allocator: *mem.Allocator) mem.Allocator.Error![]const u8 {
+        switch (self) {
+            .SubTable => |t| return t.displayName(),
+            .Array => |vals| {
+                var list = std.ArrayList([]const u8).init(allocator);
+                for (vals) |val| {
+                    try list.append(try val.string(allocator));
+                }
+                defer list.deinit();
+                const joined = try mem.join(allocator, ", ", list.toSlice());
+                return try mem.concat(allocator, u8, [_][]const u8{ "[", joined, "]" });
+            },
+            .String => |s| return s,
+            .Integer => |i| return try std.fmt.allocPrint(allocator, "{}", i),
+            .Float => |i| return try std.fmt.allocPrint(allocator, "{}", i),
+            .Boolean => |b| return if (b) "true" else "false",
+        }
+    }
+
     fn fromString(allocator: *mem.Allocator, str: []const u8) Error!Value {
         // can be at most str size
         if (mem.indexOfScalar(u8, str, '\\') == null) { // if we dont find any escaped char
-            return Value{ .String = str };
+            return Value{ .String = trimQuotes(u8, str) };
         }
         // var new = try allocator.alloc(u8, str.len);
         //  TODO(hazebooth): find a way to use a buffer while still being able to edit
@@ -239,7 +258,7 @@ pub const Value = union(ValueType) {
             srcPtr += 1;
         }
         if (dbg) warn("final={{{}}}\n", buf.toSliceConst());
-        return Value{ .String = buf.toOwnedSlice() };
+        return Value{ .String = trimQuotes(u8, buf.toOwnedSlice()) };
     }
 
     fn fromBoolean(str: []const u8) Value {
@@ -396,15 +415,13 @@ pub const Table = struct {
         }
         it.reset();
         while (it.next()) |kv| {
+            var n: usize = 0;
+            while (n < level) : (n += 1) {
+                warn("  ");
+            }
             switch (kv.value) {
                 .SubTable => {},
-                else => |v| {
-                    var n: usize = 0;
-                    while (n < level) : (n += 1) {
-                        warn("  ");
-                    }
-                    warn("┣ {} = {}\n", kv.key, v);
-                },
+                else => |v| warn("┣ {} = {}\n", kv.key, v.string(self.allocator)),
             }
         }
     }
@@ -536,7 +553,7 @@ pub const Parser = struct {
         };
         const rawLagChar = self.source[self.lagIndex];
         const lagChar: []const u8 = if (rawLagChar == '\n') "\\n" else [_]u8{rawLagChar};
-        warn("index: {}, {{{}|{}|{}}} | lagIndex: {}, {{{}|{}|{}}}\n", self.index, leftIndexWindow, char, rightIndexWindow, self.lagIndex, leftLagIndexWindow, lagChar, rightLagIndexWindow);
+        warn("index: {}, {{{}|{}|{}}} | lagIndex: {}, {{{}|{}|{}}} | arrValDepth: {}\n", self.index, leftIndexWindow, char, rightIndexWindow, self.lagIndex, leftLagIndexWindow, lagChar, rightLagIndexWindow, self.valueArrayDepth);
     }
 
     /// finish sets the parsers internal state to done (which is index, lagIndex == source.len + 1)
@@ -600,7 +617,7 @@ pub const Parser = struct {
         const eof = self.index == self.source.len - 1;
         if (dbg) {
             self.print(5);
-            if (quoteEvent != .None) warn("quoteEvent: {}\n", quoteEvent);
+            if (quoteEvent != .None and self.valueArrayDepth == 0) warn("quoteEvent: {}\n", quoteEvent);
         }
         switch (self.state) {
             // we are at the default state,
@@ -645,15 +662,19 @@ pub const Parser = struct {
                         const oldLagIndex = self.lagIndex;
                         defer self.lagIndex = oldLagIndex;
                         return self.skipToNewline();
-                    } else if (char == ',') { // new value
+                    } else if (char == ',' and self.valueArrayDepth == 1) { // new value
                         const value = self.source[self.lagIndex..self.index];
-                        try self.arrayValues.append(stripWhitespace(value));
+                        const strippedValue = stripWhitespace(value);
+                        try self.arrayValues.append(strippedValue);
                         self.lagIndex = self.index + 1;
                     } else if (char == '[') {
                         self.valueArrayDepth += 1;
                     } else if (char == ']') {
                         self.valueArrayDepth -= 1;
                         if (self.valueArrayDepth == 0) {
+                            // there is still one more value to add
+                            try self.arrayValues.append(stripWhitespace(self.source[self.lagIndex..self.index]));
+                            const lastValue = self.source[self.lagIndex..self.index];
                             const strippedKey = stripWhitespace(self.key.?);
                             if (strippedKey.len == 0) return error.BadKey;
                             if (self.arrayValues.count() == 0) {
@@ -676,7 +697,7 @@ pub const Parser = struct {
                                 });
                             }
                             self.key = null;
-                            self.lagIndex = self.index;
+                            self.lagIndex = self.index + 1;
                             self.setState(.Root);
                         }
                     }
@@ -811,7 +832,6 @@ pub const Parser = struct {
     };
 
     pub fn parse(allocator: *mem.Allocator, source: []const u8) !Table {
-        warn("\n");
         var root = Table.newRoot(allocator);
         var parser = Parser.init(allocator, source);
         defer parser.deinit();
@@ -883,87 +903,6 @@ pub const Parser = struct {
         }
         return root;
     }
-
-    // caller is responsible for freeing the resulting table
-    pub fn parse2(allocator: *mem.Allocator, source: []const u8) !Table {
-        var rootTable = Table.newRoot(allocator);
-        var parser = Parser.init(allocator, source);
-        defer parser.deinit();
-        const tokens = try parser.lex();
-        var current = &rootTable;
-        var consumingInlineTable: ?Table = null;
-        var tableArrayCtx: ?ArrayTableContext = null;
-        for (tokens) |token| {
-            if (dbg) warn("consuming token {}\n", token);
-            if (tableArrayCtx) |*ctx| {
-                switch (token) {
-                    .KeyValue => |kv| try ctx.currentTable.put(kv.key, try Value.from(allocator, kv.kind, kv.value)),
-                    .TableDefinition => |tableName| { // normal table def, go back to normal
-                        try rootTable.put(ctx.name, ctx.toValue());
-                        tableArrayCtx = null;
-                        var newTable = Table.newNamed(allocator, tableName);
-                        if (current != &rootTable) {
-                            try rootTable.put(current.name.?, Value{ .SubTable = current.* });
-                        }
-                        current = &newTable;
-                    },
-                    .TableArrayDefinition => |tableName| { // start a new object
-                        try ctx.another();
-                    },
-                    else => unreachable,
-                }
-            } else if (consumingInlineTable) |*t| {
-                switch (token) {
-                    .KeyValue => |kv| try t.put(kv.key, try Value.from(allocator, kv.kind, kv.value)),
-                    .StopInlineTable => {
-                        try rootTable.put(t.name.?, Value{ .SubTable = t.* });
-                        consumingInlineTable = null;
-                    },
-                    else => unreachable,
-                }
-            } else {
-                switch (token) {
-                    .KeyValue => |kv| try current.put(kv.key, try Value.from(allocator, kv.kind, kv.value)),
-                    .KeyValueArray => |kva| {
-                        var arr = std.ArrayList(Value).init(allocator);
-                        for (kva.values) |value| {
-                            try arr.append(try Value.from(allocator, kva.kind, value));
-                        }
-                        const values = arr.toOwnedSlice();
-                        try current.put(kva.key, Value{ .Array = values });
-                    },
-                    .InlineTableDefinition => |tableName| {
-                        var newTable = Table.newNamed(allocator, tableName);
-                        consumingInlineTable = newTable;
-                    },
-                    .TableDefinition => |tableName| {
-                        if (current != &rootTable) {
-                            warn("putting {} in root...\n", current.displayName());
-                            try rootTable.put(current.name.?, Value{ .SubTable = current.* });
-                        }
-                        warn("just created table: {}\n", name);
-                        var newTable = Table.newNamed(allocator, name);
-                        current = &newTable;
-                    },
-                    .StopInlineTable => unreachable,
-                    .TableArrayDefinition => |tableName| {
-                        tableArrayCtx = ArrayTableContext.init(allocator, &rootTable, tableName);
-                    },
-                }
-            }
-        }
-        if (current != &rootTable) {
-            // not root table, so name is always available.
-            warn("putting {} back into root\n", current.name.?);
-            try rootTable.put(current.name.?, Value{ .SubTable = current.* });
-        }
-        if (tableArrayCtx) |*ctx| {
-            try ctx.another();
-            try rootTable.put(ctx.name, ctx.toValue());
-            tableArrayCtx = null;
-        }
-        return rootTable;
-    }
 };
 
 fn stripWhitespace(source: []const u8) []const u8 {
@@ -976,6 +915,10 @@ fn isValidKeyChar(char: u8) bool {
     const isDash = char == '_' or char == '-';
     const isQuote = char == '"' or char == '\'';
     return ascii.isSpace(char) or ascii.isAlpha(char) or ascii.isDigit(char) or isDash or isQuote or isPunct;
+}
+
+fn trimQuotes(comptime T: type, input: var) @typeOf(input) {
+    return mem.trim(T, input, "\"'");
 }
 
 fn isValidValueInteger(value: []const u8) bool {
