@@ -7,6 +7,22 @@ const warn = std.debug.warn;
 const FA = std.debug.failing_allocator;
 const GA = std.debug.global_allocator;
 
+// test "main test" {
+//     const file =
+//         \\foo=123
+//         \\[table]
+//         \\foo="foo in table"
+//         \\[other]
+//         \\foo="foo in other table"
+//         \\[two.tables]
+//         \\foo="deeply nested foo"
+//     ;
+//     const table = try toml.Table.fromString(GA, file);
+//     warn("\n========ROOT PRINT=========\n");
+//     table.print();
+//     t.expect(false);
+// }
+
 fn printTokens(tokens: []toml.Token) void {
     for (tokens) |token| {
         switch (token) {
@@ -253,6 +269,18 @@ test "Inline Table" {
     t.expectEqual(inlineTable.get("age").?.Integer, 18);
 }
 
+test "Tables" {
+    var buf: [1024 * 5]u8 = undefined;
+    const allocator = &std.heap.FixedBufferAllocator.init(&buf).allocator;
+    const tableFile =
+        \\[subtable]
+        \\foo=123
+    ;
+    const root = try toml.Table.fromString(allocator, tableFile);
+    const subtable = root.get("subtable").?.SubTable;
+    t.expectEqual(root.get("subtable").?.SubTable.get("foo").?.Integer, 123);
+}
+
 test "Array of Tables" {
     const file =
         \\[[products]]
@@ -299,3 +327,68 @@ test "Unicode Replacements" {
     t.expect(try expectString(GA, "foo = '\\u50b7' #comment", "foo", singleQuoted("傷")));
     t.expect(try expectString(GA, "foo = '\\U000050b7' #comment", "foo", singleQuoted("傷")));
 }
+
+test "Stress test" {
+    const stressTest =
+        \\# Test file for TOML
+        \\# Only this one tries to emulate a TOML file written by a user of the kind of parser writers probably hate
+        \\# This part you'll really hate
+        \\
+        \\[the]
+        \\test_string = "You'll hate me after this - #"          # " Annoying, isn't it?
+        \\
+        \\    [the.hard]
+        \\    test_array = [ "] ", " # "]      # ] There you go, parse this!
+        \\    test_array2 = [ "Test #11 ]proved that", "Experiment #9 was a success" ]
+        \\    # You didn't think it'd as easy as chucking out the last #, did you?
+        \\    another_test_string = " Same thing, but with a string #"
+        \\    harder_test_string = " And when \"'s are in the string, along with # \""   # "and comments are there too"
+        \\    # Things will get harder
+        \\
+        \\        [the.hard."bit#"]
+        \\        "what?" = "You don't think some user won't do that?"
+        \\        multi_line_array = [
+        \\            "]",
+        \\            # ] Oh yes I did
+        \\            ]
+        \\# Each of the following keygroups/key value pairs should produce an error. Uncomment to them to test
+        \\
+        \\#[error]   if you didn't catch this, your parser is broken
+        \\#string = "Anything other than tabs, spaces and newline after a keygroup or key value pair has ended should produce an error unless it is a comment"   like this
+        \\#array = [
+        \\#         "This might most likely happen in multiline arrays",
+        \\#         Like here,
+        \\#         "or here,
+        \\#         and here"
+        \\#         ]     End of array comment, forgot the #
+        \\#number = 3.14  pi <--again forgot the #         
+    ;
+    const table = try toml.Table.fromString(GA, stressTest);
+    table.print();
+}
+
+// test "test" {
+//     warn("\n");
+//     var buf: [1024 * 16]u8 = undefined;
+//     const allocator = &std.heap.FixedBufferAllocator.init(&buf).allocator;
+//     const file =
+//         \\[alpha]
+//         \\foo=123
+//         \\[alpha.delta]
+//         \\foo=123
+//     ;
+//     const tab = try toml.Table.fromString(allocator, file);
+//     tab.print();
+// }
+
+// test "test" {
+//     warn("\n");
+//     var buf: [1024 * 16]u8 = undefined;
+//     const allocator = &std.heap.FixedBufferAllocator.init(&buf).allocator;
+//     var tab = toml.Table.newRoot(allocator);
+//     try tab.put("alpha.beta", toml.Value{ .String = "wtf" });
+//     try tab.put("alpha.delta", toml.Value{ .String = "wtf-d" });
+//     try tab.put("alpha.delta.gamma", toml.Value{ .String = "wtf-d-g" });
+//     try tab.put("gamma", toml.Value{ .String = "wtf-g" });
+//     tab.print();
+// }
