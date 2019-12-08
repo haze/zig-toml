@@ -3,7 +3,7 @@ const testing = std.testing;
 const mem = std.mem;
 const ascii = std.ascii;
 
-// Removoe later
+// Remove later
 const warn = std.debug.warn;
 const dbg = false;
 
