@@ -80,15 +80,67 @@ pub const StreamingParser = struct {
     };
 
     const State = union(enum) {
-        ExpectingKey,
-        ReadingKey: ?QuoteKind,
-        ExpectingValue,
-        ReadingValue: ValueKind,
+        const NestedState = enum {
+            within_inline_table,
+            within_array,
+            top_level,
+
+            fn isSeparatorChar(self: NestedState, char: u8) bool {
+                return switch (self) {
+                    .within_inline_table, .within_array => char == ',',
+                    else => false,
+                };
+            }
+
+            fn isEndChar(self: NestedState, char: u8) bool {
+                return switch (self) {
+                    .within_inline_table => char == '}',
+                    .within_array => char == ']',
+                    else => false,
+                };
+            }
+
+            /// Calling `endLexeme` with `.top_level` is safety checked UB
+            fn endLexeme(self: NestedState, optional_value_kind: ?TokenStream.ValueKind) Lexeme.Kind {
+                return switch (self) {
+                    .within_inline_table => .{ .InlineTableEnd = optional_value_kind },
+                    .within_array => .{ .ArrayEnd = optional_value_kind },
+                    else => unreachable,
+                };
+            }
+
+            /// Calling `separatorLexeme` with `.top_level` is safety checked UB
+            fn separatorLexeme(self: NestedState, optional_value_kind: ?TokenStream.ValueKind) Lexeme.Kind {
+                return switch (self) {
+                    .within_inline_table => .{ .InlineTableSeparator = optional_value_kind },
+                    .within_array => .{ .ArraySeparator = optional_value_kind },
+                    else => unreachable,
+                };
+            }
+
+            fn acceptsSeparator(self: NestedState) bool {
+                return switch (self) {
+                    .top_level => false,
+                    else => true,
+                };
+            }
+        };
+        /// bool represents whether or not said item is within an inline table
+        ExpectingKey: bool,
+        ReadingKey: struct {
+            quotes: ?QuoteKind,
+            within_inline_table: bool,
+        },
+        ExpectingValue: NestedState,
+        ReadingValue: struct {
+            kind: ValueKind,
+            nested_state: NestedState,
+        },
 
         /// When we see a '0', '+' or '-', we are unsure if it's still a float, integer, or non-negative integer
-        ReadingNumberValue,
-        ReadingFloatFromDecimal,
-        ReadingFloatFromExponent,
+        ReadingNumberValue: NestedState,
+        ReadingFloatFromDecimal: NestedState,
+        ReadingFloatFromExponent: NestedState,
         // what initiated the float reading? this is to make sure we don't parse multiple decimals or exponents
         // this also may represent whether or not we found both
         // TODO(haze): better comment
@@ -96,21 +148,29 @@ pub const StreamingParser = struct {
             seen_decimal: bool = false,
             seen_exponent: bool = false,
             seen_sign: bool = false,
+            nested_state: NestedState,
         },
 
-        ReadingInf: StatefulRead("inf"),
-        ReadingNan: StatefulRead("nan"),
-        ReadingPrefixedIntegerValue,
+        ReadingInf: struct {
+            progress: StatefulRead("inf") = .{},
+            nested_state: NestedState,
+        },
+        ReadingNan: struct {
+            progress: StatefulRead("nan") = .{},
+            nested_state: NestedState,
+        },
+        ReadingPrefixedIntegerValue: NestedState,
 
         ReadingTableNamePart,
         ReadingTableNameTopLevel,
 
-        ExpectingKeyValueTransition,
-        ReadingComment,
+        /// bool represents whether or not said item is within an inline table
+        ExpectingKeyValueTransition: bool,
+        ReadingComment: NestedState,
     };
 
     pub const Lexeme = struct {
-        pub const Kind = enum {
+        pub const Kind = union(enum) {
             Key,
             KeyWithTransition,
             KeyValueTransition,
@@ -122,12 +182,21 @@ pub const StreamingParser = struct {
             TableNameBegin,
             TableNameEnd,
 
+            InlineTableBegin,
+            InlineTableEnd: ?TokenStream.ValueKind,
+            InlineTableSeparator: ?TokenStream.ValueKind,
+
+            ArrayBegin,
+            ArrayEnd: ?TokenStream.ValueKind,
+            ArraySeparator: ?TokenStream.ValueKind,
+
             fn toValueKind(self: Kind) TokenStream.ValueKind {
                 return switch (self) {
                     .IntValue => .Int,
                     .StringValue => .String,
                     .BooleanValue => .Boolean,
                     .FloatValue => .Float,
+                    .InlineTableEnd, .InlineTableSeparator => |maybe_value_kind| maybe_value_kind.?,
                     else => unreachable,
                 };
             }
@@ -165,7 +234,8 @@ pub const StreamingParser = struct {
     }
 
     fn reset(self: *StreamingParser) void {
-        self.state = .ExpectingKey;
+        // reset to .top_level
+        self.state = .{ .ExpectingKey = false };
         self.offset = 0;
         self.cursor.reset();
     }
@@ -211,9 +281,9 @@ pub const StreamingParser = struct {
         };
 
         if (!isComptime())
-            std.debug.print("{}, reading: {}, offset={}, {}\n", .{
-                self.state,
+            std.debug.print("reading: {}, {}, offset={}, {}\n", .{
                 dbg_slice,
+                self.state,
                 self.offset,
                 self.cursor,
             });
@@ -225,7 +295,7 @@ pub const StreamingParser = struct {
                 // we can't finish a float with EOF
                 .ReadingFloatFromDecimal => return error.UnfinishedFloatValue,
                 .ReadingNumberValue => return self.makeLexeme(.IntValue),
-                .ReadingValue => |value_kind| return self.makeLexeme(value_kind.lexemeKind()),
+                .ReadingValue => |value_state| return self.makeLexeme(value_state.kind.lexemeKind()),
                 else => return null,
             }
         };
@@ -236,9 +306,13 @@ pub const StreamingParser = struct {
         const is_sign = char == '+' or char == '-';
 
         switch (self.state) {
-            .ReadingComment => {
+            .ReadingComment => |comment_state| {
                 if (char == '\n') {
-                    self.state = .ExpectingKey;
+                    if (comment_state == .within_array) {
+                        self.state = .{ .ExpectingValue = comment_state };
+                    } else {
+                        self.state = .{ .ExpectingKey = comment_state == .within_inline_table };
+                    }
                     return null;
                 }
             },
@@ -246,7 +320,7 @@ pub const StreamingParser = struct {
                 if (is_space)
                     return null;
                 if (char == ']') {
-                    self.state = .ExpectingKey;
+                    self.state = .{ .ExpectingKey = false };
                     return null;
                 }
                 self.updateLexemeOffset();
@@ -258,82 +332,111 @@ pub const StreamingParser = struct {
                     self.state = .ReadingTableNameTopLevel;
                     return self.makeLexeme(.TableNamePart);
                 } else if (char == ']') {
-                    self.state = .ExpectingKey;
+                    self.state = .{ .ExpectingKey = false };
                     return self.makeLexeme(.TableNameEnd);
                 }
                 self.incrementBytesPerLexeme();
             },
-            .ExpectingKey => {
+            .ExpectingKey => |within_inline_table| {
+                if (within_inline_table and char == ',') {
+                    self.updateLexemeOffset();
+                    return self.makeLexeme(.{ .InlineTableSeparator = null });
+                }
                 if (is_space) {
                     return null;
                 } else if (char == '#') {
-                    self.state = .ReadingComment;
+                    self.state = .{ .ReadingComment = if (within_inline_table) .within_inline_table else .top_level };
                     return null;
+                } else if (char == '}') {
+                    self.updateLexemeOffset();
+                    return self.makeLexeme(.{ .InlineTableEnd = null });
                 } else if (char == '[') {
+                    if (within_inline_table)
+                        return error.TableRedefinitionInInlineTable;
                     self.updateLexemeOffset();
                     self.state = .ReadingTableNameTopLevel;
                     return self.makeLexeme(.TableNameBegin);
                 } else {
                     self.updateLexemeOffset();
-                    self.state = .{ .ReadingKey = maybe_quote };
+                    self.state = .{ .ReadingKey = .{ .quotes = maybe_quote, .within_inline_table = within_inline_table } };
                     if (is_quote)
                         self.incrementBytesPerLexeme();
                     return null;
                 }
             },
-            .ReadingKey => |maybe_key_quote| {
-                if (is_space and maybe_key_quote == null) {
-                    self.state = .ExpectingKeyValueTransition;
+            .ReadingKey => |reading_key_state| {
+                if (is_space and reading_key_state.quotes == null) {
+                    self.state = .{ .ExpectingKeyValueTransition = reading_key_state.within_inline_table };
                     return self.makeLexeme(.Key);
                 }
                 if (maybe_quote != null and
-                    maybe_key_quote != null and
-                    maybe_quote.? == maybe_key_quote.?)
+                    reading_key_state.quotes != null and
+                    maybe_quote.? == reading_key_state.quotes.?)
                 {
-                    self.state = .ExpectingKeyValueTransition;
+                    self.state = .{ .ExpectingKeyValueTransition = reading_key_state.within_inline_table };
                     const lex = self.makeLexeme(.Key);
                     self.updateLexemeOffset();
                     return lex;
                 }
                 if (char == '=') {
-                    self.state = .ExpectingValue;
+                    self.state = .{ .ExpectingValue = if (reading_key_state.within_inline_table) .within_inline_table else .top_level };
                     const lex = self.makeLexeme(.KeyWithTransition);
                     self.updateLexemeOffset();
                     return lex;
                 }
                 self.incrementBytesPerLexeme();
             },
-            .ExpectingKeyValueTransition => {
+            .ExpectingKeyValueTransition => |within_inline_table| {
                 if (is_space)
                     return null;
                 if (char == '=') {
-                    self.state = .ExpectingValue;
+                    self.state = .{ .ExpectingValue = if (within_inline_table) .within_inline_table else .top_level };
                     const lex = self.makeLexeme(.KeyValueTransition);
                     self.updateLexemeOffset();
                     return lex;
                 }
             },
-            .ExpectingValue => {
+            .ExpectingValue => |expecting_value_state| {
                 if (is_space)
                     return null;
                 // float numbers may not start with a .
                 if (char == '.') {
                     return error.InvalidFloatValue;
                 }
-                if (maybe_quote != null) {
-                    self.state = .{ .ReadingValue = .{ .String = maybe_quote.? } };
+                if (char == '{') {
+                    self.updateLexemeOffset();
+                    self.state = .{ .ExpectingKey = true };
+                    return self.makeLexeme(.InlineTableBegin);
+                }
+                if (maybe_quote) |quotes| {
+                    self.state = .{
+                        .ReadingValue = .{
+                            .nested_state = expecting_value_state,
+                            .kind = .{ .String = quotes },
+                        },
+                    };
                     self.updateLexemeOffset();
                     return null;
                 }
                 if (char == 'i') {
-                    self.state = .{ .ReadingInf = .{} };
+                    self.updateLexemeOffset();
+                    self.state = .{
+                        .ReadingInf = .{
+                            .nested_state = expecting_value_state,
+                        },
+                    };
                     return null;
                 } else if (char == 'n') {
-                    self.state = .{ .ReadingNan = .{} };
+                    self.updateLexemeOffset();
+                    self.state = .{
+                        .ReadingNan = .{
+                            .nested_state = expecting_value_state,
+                        },
+                    };
                     return null;
                 }
                 if (char == '0' or char == '+' or char == '-' or std.ascii.isDigit(char)) {
-                    self.state = .ReadingNumberValue;
+                    self.state = .{ .ReadingNumberValue = expecting_value_state };
                     self.updateLexemeOffset();
                     return null;
                 }
@@ -342,9 +445,12 @@ pub const StreamingParser = struct {
                     self.updateLexemeOffset();
                     self.state = .{
                         .ReadingValue = .{
-                            .Boolean = .{
-                                .offset = 1,
-                                .kind = if (is_true) .True else .False,
+                            .nested_state = expecting_value_state,
+                            .kind = .{
+                                .Boolean = .{
+                                    .offset = 1,
+                                    .kind = if (is_true) .True else .False,
+                                },
                             },
                         },
                     };
@@ -352,50 +458,86 @@ pub const StreamingParser = struct {
             },
             .ReadingInf => |*inf_state| {
                 if (is_space) {
-                    if (inf_state.isFinished()) {
-                        self.state = .ExpectingKey;
+                    if (inf_state.progress.isFinished()) {
+                        self.state = .{ .ExpectingKey = inf_state.nested_state == .within_inline_table };
                         return null;
                     } else return error.InvalidFloatValueInf;
                 }
-                if (!inf_state.matches(char))
+                if (inf_state.nested_state == .within_inline_table and inf_state.nested_state.isEndChar(char)) {
+                    return self.makeLexeme(inf_state.nested_state.endLexeme(.Float));
+                }
+                if (inf_state.nested_state.acceptsSeparator() and inf_state.nested_state.isSeparatorChar(char)) {
+                    return self.makeLexeme(inf_state.nested_state.separatorLexeme(.Float));
+                }
+                if (!inf_state.progress.matches(char))
                     return error.InvalidFloatValueInf;
-                inf_state.offset += 1;
+                inf_state.progress.offset += 1;
+                self.incrementBytesPerLexeme();
                 return null;
             },
             .ReadingNan => |*nan_state| {
                 if (is_space) {
-                    if (nan_state.isFinished()) {
-                        self.state = .ExpectingKey;
+                    if (nan_state.progress.isFinished()) {
+                        self.state = .{ .ExpectingKey = nan_state.nested_state == .within_inline_table };
                         return null;
                     } else return error.InvalidFloatValueNan;
                 }
-                if (!nan_state.matches(char))
+                if (nan_state.nested_state == .within_inline_table and nan_state.nested_state.isEndChar(char)) {
+                    return self.makeLexeme(nan_state.nested_state.endLexeme(.Float));
+                }
+                if (nan_state.nested_state.acceptsSeparator() and nan_state.nested_state.isSeparatorChar(char)) {
+                    return self.makeLexeme(nan_state.nested_state.separatorLexeme(.Float));
+                }
+                if (!nan_state.progress.matches(char))
                     return error.InvalidFloatValueNan;
-                nan_state.offset += 1;
+                nan_state.progress.offset += 1;
+                self.incrementBytesPerLexeme();
                 return null;
             },
-            .ReadingNumberValue => {
+            .ReadingNumberValue => |number_value_nested_state| {
                 if (char == 'i') {
-                    self.state = .{ .ReadingInf = .{} };
+                    // this is so we account for the +/-
+                    self.incrementBytesPerLexeme();
+                    self.state = .{
+                        .ReadingInf = .{
+                            .nested_state = number_value_nested_state,
+                        },
+                    };
                     return null;
                 } else if (char == 'n') {
-                    self.state = .{ .ReadingNan = .{} };
+                    // this is so we account for the +/-
+                    self.incrementBytesPerLexeme();
+                    self.state = .{
+                        .ReadingNan = .{
+                            .nested_state = number_value_nested_state,
+                        },
+                    };
                     return null;
                 }
                 if (char == 'b' or char == 'x' or char == 'o') {
-                    self.state = .ReadingPrefixedIntegerValue;
+                    self.state = .{ .ReadingPrefixedIntegerValue = number_value_nested_state };
                     return null;
                 }
                 if (char == '.') {
-                    self.state = .ReadingFloatFromDecimal;
+                    self.state = .{ .ReadingFloatFromDecimal = number_value_nested_state };
                     return null;
                 } else if (char == 'e' or char == 'E') {
-                    self.state = .ReadingFloatFromExponent;
+                    self.state = .{ .ReadingFloatFromExponent = number_value_nested_state };
                     return null;
                 }
                 if (is_space) {
-                    self.state = .ExpectingKey;
+                    self.state = .{ .ExpectingKey = number_value_nested_state == .within_inline_table };
+                    self.updateLexemeOffset();
                     return self.makeLexeme(.IntValue);
+                }
+                if (number_value_nested_state == .within_inline_table) {
+                    if (char == '}') {
+                        self.state = .{ .ExpectingKey = false };
+                        return self.makeLexeme(.{ .InlineTableEnd = .Int });
+                    } else if (is_space or char == ',') {
+                        self.state = .{ .ExpectingKey = true };
+                        return self.makeLexeme(.IntValue);
+                    }
                 }
                 if (!std.ascii.isDigit(char) and char != '_')
                     return error.InvalidIntegerValue;
@@ -403,17 +545,23 @@ pub const StreamingParser = struct {
             },
             // this is after we read a 'e|E' from ReadingNumber
             // the next character MUST be a digit
-            .ReadingFloatFromExponent => {
+            .ReadingFloatFromExponent => |float_from_exp_nested_state| {
                 if (!std.ascii.isDigit(char) and !is_sign)
                     return error.InvalidFloatValue;
-                self.state = .{ .ReadingFloatValue = .{ .seen_exponent = true, .seen_sign = is_sign } };
+                self.state = .{
+                    .ReadingFloatValue = .{
+                        .seen_exponent = true,
+                        .seen_sign = is_sign,
+                        .nested_state = float_from_exp_nested_state,
+                    },
+                };
                 return null;
             },
-            .ReadingFloatFromDecimal => {
+            .ReadingFloatFromDecimal => |float_from_dec_nested_state| {
                 // can't end a float value with space or non digit
                 if (is_space or !std.ascii.isDigit(char))
                     return error.InvalidFloatValue;
-                self.state = .{ .ReadingFloatValue = .{ .seen_decimal = true } };
+                self.state = .{ .ReadingFloatValue = .{ .seen_decimal = true, .nested_state = float_from_dec_nested_state } };
                 return null;
             },
             .ReadingFloatValue => |*float_state| {
@@ -445,20 +593,21 @@ pub const StreamingParser = struct {
                 if (!std.ascii.isDigit(char))
                     return error.InvalidFloatValue;
                 if (is_space) {
-                    self.state = .ExpectingKey;
+                    self.state = .{ .ExpectingKey = float_state.nested_state == .within_inline_table };
                     return null;
                 }
             },
-            .ReadingPrefixedIntegerValue => {
+            // TODO(haze): vvvv
+            .ReadingPrefixedIntegerValue => |int_value_nested_state| {
                 if (is_space) {
-                    self.state = .ExpectingKey;
+                    self.state = .{ .ExpectingKey = int_value_nested_state == .within_inline_table };
                 }
             },
-            .ReadingValue => |*value_kind| {
-                switch (value_kind.*) {
+            .ReadingValue => |*value_state| {
+                switch (value_state.kind) {
                     .String => |string_quote_kind| {
                         if (maybe_quote != null and string_quote_kind == maybe_quote.?) {
-                            self.state = .ExpectingKey;
+                            self.state = .{ .ExpectingKey = value_state.nested_state == .within_inline_table };
                             self.incrementBytesPerLexeme();
                             return self.makeLexeme(.StringValue);
                         }
@@ -468,8 +617,14 @@ pub const StreamingParser = struct {
                     .Boolean => |*boolean_kind| {
                         if (is_space) {
                             if (boolean_kind.isFinished()) {
-                                self.state = .ExpectingKey;
+                                self.state = .{ .ExpectingKey = value_state.nested_state == .within_inline_table };
                                 return self.makeLexeme(.BooleanValue);
+                            } else return error.InvalidBooleanValue;
+                        }
+                        if (value_state.nested_state.acceptsSeparator() and value_state.nested_state.isSeparatorChar(char)) {
+                            if (boolean_kind.isFinished()) {
+                                self.state = .{ .ExpectingKey = value_state.nested_state == .within_inline_table };
+                                return self.makeLexeme(value_state.nested_state.separatorLexeme(.Boolean));
                             } else return error.InvalidBooleanValue;
                         }
                         if (!boolean_kind.matches(char))
@@ -490,7 +645,11 @@ const TokenStream = struct {
     offset: usize = 0,
     input: []const u8,
 
+    /// current key for the being read key/value pair
     current_key: ?StreamingParser.Lexeme = null,
+    /// key for the inline table we are reading
+    inline_table_key: ?StreamingParser.Lexeme = null,
+
     seen_transition: bool = false,
     current_table_path: ?std.ArrayList([]const u8) = null,
     allocator: *mem.Allocator,
@@ -516,7 +675,11 @@ const TokenStream = struct {
             value: []const u8,
             kind: ValueKind,
         },
+        /// Table path
         TableDefinition: [][]const u8,
+        /// Key is the name of the table
+        InlineTableBegin: []const u8,
+        InlineTableEnd,
 
         fn deinit(self: *Token, allocator: *mem.Allocator) void {
             switch (self.*) {
@@ -525,6 +688,24 @@ const TokenStream = struct {
             }
         }
     };
+
+    fn processValue(self: *TokenStream, tokens: *std.ArrayList(Token), lex: StreamingParser.Lexeme) !void {
+        if (!self.seen_transition)
+            return error.ValueWithoutTransition;
+        if (self.current_key) |key| {
+            try tokens.append(.{
+                .KeyValuePair = .{
+                    .key = key.slice(self.input),
+                    .value = lex.slice(self.input),
+                    .kind = lex.kind.toValueKind(),
+                },
+            });
+            self.current_key = null;
+            self.seen_transition = true;
+            std.debug.print("set current_key to null\n", .{});
+        } else
+            return error.ReadingValueWithoutKey;
+    }
 
     fn processLexeme(
         self: *TokenStream,
@@ -538,6 +719,36 @@ const TokenStream = struct {
         if (try self.parser.feed(parser_input)) |lex| {
             std.debug.print("lex={}, slice='{}'\n", .{ lex, lex.slice(self.input) });
             switch (lex.kind) {
+                .ArraySeparator => {},
+                .ArrayBegin => {},
+                .ArrayEnd => {},
+                // this happens when we see a ','
+                .InlineTableSeparator => |maybe_value_kind| {
+                    if (maybe_value_kind != null)
+                        try self.processValue(tokens, lex);
+                    self.current_key = null;
+                    self.seen_transition = false;
+                },
+                .InlineTableBegin => {
+                    if (self.inline_table_key != null)
+                        return error.NestedInlineTables;
+                    if (self.current_key == null)
+                        return error.InlineTableWithNoKey;
+                    // set the current_key to the inline table key
+                    try tokens.append(.{ .InlineTableBegin = self.current_key.?.slice(self.input) });
+
+                    self.inline_table_key = self.current_key;
+                    self.current_key = null;
+                },
+                .InlineTableEnd => |maybe_value_kind| {
+                    if (maybe_value_kind != null)
+                        try self.processValue(tokens, lex);
+                    if (self.inline_table_key == null)
+                        return error.EndingInlineTableFromTopLevel;
+                    try tokens.append(.InlineTableEnd);
+                    self.inline_table_key = null;
+                    self.current_key = null;
+                },
                 .TableNameBegin => {
                     if (self.current_key != null)
                         return error.DefiningTableWhileReadingKey;
@@ -564,8 +775,8 @@ const TokenStream = struct {
                 .KeyWithTransition => {
                     if (self.current_key != null)
                         return error.AlreadyReadingKey;
-                    self.seen_transition = true;
                     self.current_key = lex;
+                    self.seen_transition = true;
                     std.debug.print("set current_key to {}\n", .{lex});
                 },
                 .KeyValueTransition => {
@@ -573,23 +784,7 @@ const TokenStream = struct {
                         return error.TransitionWithoutKey;
                     self.seen_transition = true;
                 },
-                .IntValue, .StringValue, .FloatValue, .BooleanValue => {
-                    if (!self.seen_transition)
-                        return error.ValueWithoutTransition;
-                    if (self.current_key) |key| {
-                        try tokens.append(.{
-                            .KeyValuePair = .{
-                                .key = key.slice(self.input),
-                                .value = lex.slice(self.input),
-                                .kind = lex.kind.toValueKind(),
-                            },
-                        });
-                        self.current_key = null;
-                        self.seen_transition = true;
-                        std.debug.print("set current_key to null\n", .{});
-                    } else
-                        return error.ReadingValueWithoutKey;
-                },
+                .IntValue, .StringValue, .FloatValue, .BooleanValue => try self.processValue(tokens, lex),
             }
         }
     }
@@ -635,8 +830,8 @@ const Table = struct {
 
 test "TokenStream" {
     var input =
-        \\[test.butt.bar."epic sauce"]
-        \\foo='bar'
+        \\table={    key="foo", bar=1,baz=true, qux=nan, boo=+inf}
+        \\other_table={cum='sauce'        }
     ;
 
     var stream = TokenStream.init(input, std.testing.allocator);
