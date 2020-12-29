@@ -1,3 +1,4 @@
+// TODO(haze): some better error names man lol
 const std = @import("std");
 const mem = std.mem;
 const testing = std.testing;
@@ -225,6 +226,7 @@ pub const StreamingParser = struct {
 
     offset: usize,
     cursor: ByteCursor,
+    array_depth: usize,
     state: State,
 
     pub fn init() StreamingParser {
@@ -408,6 +410,12 @@ pub const StreamingParser = struct {
                     self.state = .{ .ExpectingKey = true };
                     return self.makeLexeme(.InlineTableBegin);
                 }
+                if (char == '[') {
+                    self.array_depth += 1;
+                    self.updateLexemeOffset();
+                    self.state = .{ .ExpectingValue = .within_array };
+                    return self.makeLexeme(.ArrayBegin);
+                }
                 if (maybe_quote) |quotes| {
                     self.state = .{
                         .ReadingValue = .{
@@ -530,14 +538,27 @@ pub const StreamingParser = struct {
                     self.updateLexemeOffset();
                     return self.makeLexeme(.IntValue);
                 }
-                if (number_value_nested_state == .within_inline_table) {
-                    if (char == '}') {
-                        self.state = .{ .ExpectingKey = false };
-                        return self.makeLexeme(.{ .InlineTableEnd = .Int });
-                    } else if (is_space or char == ',') {
-                        self.state = .{ .ExpectingKey = true };
-                        return self.makeLexeme(.IntValue);
+                if (number_value_nested_state.isEndChar(char)) {
+                    self.state = .{ .ExpectingValue = number_value_nested_state };
+                    switch (number_value_nested_state) {
+                        .within_array => {
+                            if (self.array_depth - 1 == 0) {
+                                self.state = .{ .ExpectingKey = false };
+                            } else {
+                                self.state = .{ .ExpectingValue = number_value_nested_state };
+                            }
+                        },
+                        .within_inline_table => self.state = .{ .ExpectingKey = false },
+                        else => {},
                     }
+                    return self.makeLexeme(number_value_nested_state.endLexeme(.Int));
+                } else if (number_value_nested_state.isSeparatorChar(char)) {
+                    switch (number_value_nested_state) {
+                        .within_array => self.state = .{ .ExpectingValue = number_value_nested_state },
+                        .within_inline_table => self.state = .{ .ExpectingKey = true },
+                        else => {},
+                    }
+                    return self.makeLexeme(number_value_nested_state.separatorLexeme(.Int));
                 }
                 if (!std.ascii.isDigit(char) and char != '_')
                     return error.InvalidIntegerValue;
@@ -617,7 +638,10 @@ pub const StreamingParser = struct {
                     .Boolean => |*boolean_kind| {
                         if (is_space) {
                             if (boolean_kind.isFinished()) {
-                                self.state = .{ .ExpectingKey = value_state.nested_state == .within_inline_table };
+                                switch (value_state.nested_state) {
+                                    .within_array => self.state = .{ .ExpectingValue = value_state.nested_state == .within_inline_table },
+                                    else => self.state = .{ .ExpectingKey = value_state.nested_state == .within_inline_table },
+                                }
                                 return self.makeLexeme(.BooleanValue);
                             } else return error.InvalidBooleanValue;
                         }
@@ -641,6 +665,13 @@ pub const StreamingParser = struct {
 };
 
 const TokenStream = struct {
+    const ArrayState = struct {
+        stack: std.ArrayList(std.ArrayList(Value)),
+        current: *std.ArrayList(Value),
+        /// cannot be `.Array`
+        kind: ?ValueKind = null,
+    };
+
     parser: StreamingParser = StreamingParser.init(),
     offset: usize = 0,
     input: []const u8,
@@ -652,27 +683,43 @@ const TokenStream = struct {
 
     seen_transition: bool = false,
     current_table_path: ?std.ArrayList([]const u8) = null,
-    allocator: *mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+
+    array_state: ?ArrayState = null,
 
     pub fn init(input: []const u8, allocator: *mem.Allocator) TokenStream {
-        return TokenStream{ .input = input, .allocator = allocator };
+        return TokenStream{
+            .input = input,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+        };
     }
 
     const TokenKind = enum {
         KeyValuePair,
     };
 
-    const ValueKind = enum {
+    const ValueKind = union(enum) {
         Int,
         Float,
         Boolean,
         String,
+        Array,
+    };
+
+    const Value = union(enum) {
+        text: []const u8,
+        array: std.ArrayList(Value),
     };
 
     const Token = union(enum) {
         KeyValuePair: struct {
+            const ArrayInfo = struct {
+                depth: usize,
+                kind: ValueKind,
+            };
             key: []const u8,
-            value: []const u8,
+            value: Value,
+            array_information: ?ArrayInfo = null,
             kind: ValueKind,
         },
         /// Table path
@@ -696,7 +743,7 @@ const TokenStream = struct {
             try tokens.append(.{
                 .KeyValuePair = .{
                     .key = key.slice(self.input),
-                    .value = lex.slice(self.input),
+                    .value = .{ .text = lex.slice(self.input) },
                     .kind = lex.kind.toValueKind(),
                 },
             });
@@ -719,9 +766,44 @@ const TokenStream = struct {
         if (try self.parser.feed(parser_input)) |lex| {
             std.debug.print("lex={}, slice='{}'\n", .{ lex, lex.slice(self.input) });
             switch (lex.kind) {
-                .ArraySeparator => {},
-                .ArrayBegin => {},
-                .ArrayEnd => {},
+                .ArraySeparator => {
+                    if (self.array_state == null)
+                        return error.MissingArray;
+                    if (self.array_state) |arr_state| {
+                        try arr_state.current.append(.{ .text = lex.slice(self.input) });
+                    } else return error.NoArrayToAddItemTo;
+                },
+                .ArrayBegin => {
+                    if (self.array_state) |*arr_state| {
+                        std.debug.print("We are nesting one more layer (depth={})\n", .{arr_state.stack.items.len});
+                    } else {
+                        std.debug.print("Creating new array stack...\n", .{});
+                        var stack = std.ArrayList(std.ArrayList(Value)).init(&self.arena.allocator);
+                        try stack.append(std.ArrayList(Value).init(&self.arena.allocator));
+                        self.array_state = .{
+                            .stack = stack,
+                            .current = &stack.items[0],
+                        };
+                    }
+                },
+                .ArrayEnd => |item| {
+                    std.debug.print("END_ITEM={}\n", .{item});
+                    if (self.current_key == null)
+                        return error.ArrayWithNoKey;
+                    if (self.array_state) |arr_state| {
+                        try arr_state.current.append(.{ .text = lex.slice(self.input) });
+                        try tokens.append(.{
+                            .KeyValuePair = .{
+                                .key = self.current_key.?.slice(self.input),
+                                // by this point, current should point towards the initial array
+                                .value = .{ .array = arr_state.current.* },
+                                .kind = .Array,
+                            },
+                        });
+                        self.current_key = null;
+                        self.seen_transition = true;
+                    } else return error.ArrayEndWithNoArray;
+                },
                 // this happens when we see a ','
                 .InlineTableSeparator => |maybe_value_kind| {
                     if (maybe_value_kind != null)
@@ -791,7 +873,7 @@ const TokenStream = struct {
 
     /// Caller is responsible for freeing the returned memory with the same `allocator` provided.
     fn process(self: *TokenStream) ![]Token {
-        var tokens = std.ArrayList(Token).init(self.allocator);
+        var tokens = std.ArrayList(Token).init(&self.arena.allocator);
         errdefer tokens.deinit();
         while (self.offset != self.input.len) {
             try self.processLexeme(&tokens);
@@ -801,10 +883,9 @@ const TokenStream = struct {
         return tokens.toOwnedSlice();
     }
 
-    fn freeTokens(self: *TokenStream, tokens: []Token) void {
-        for (tokens) |*token|
-            token.deinit(self.allocator);
-        self.allocator.free(tokens);
+    fn deinit(self: *TokenStream) void {
+        self.arena.deinit();
+        self.* = undefined;
     }
 };
 
@@ -830,15 +911,13 @@ const Table = struct {
 
 test "TokenStream" {
     var input =
-        \\table={    key="foo", bar=1,baz=true, qux=nan, boo=+inf}
-        \\other_table={cum='sauce'        }
+        \\key=[true, false]
     ;
 
     var stream = TokenStream.init(input, std.testing.allocator);
+    defer stream.deinit();
 
-    const tokens = try stream.process();
-    defer stream.freeTokens(tokens);
-    for (tokens) |token|
+    for (try stream.process()) |token|
         switch (token) {
             .TableDefinition => |parts| {
                 for (parts) |part, idx| {
@@ -852,9 +931,36 @@ test "TokenStream" {
                     }
                 }
             },
-            else => std.debug.print("token={}\n", .{token}),
+            else => switch (token) {
+                .KeyValuePair => |kvp| {
+                    switch (kvp.value) {
+                        .array => |items| {
+                            std.debug.print("[ARRAY] key={}, \nval=[\n", .{kvp.key});
+                            for (items.items) |item|
+                                std.debug.print("\t{},\n", .{item});
+                            std.debug.print("]\n", .{});
+                        },
+                        else => std.debug.print("token={}\n", .{token}),
+                    }
+                },
+                else => std.debug.print("token={}\n", .{token}),
+            },
         };
 }
+
+// fn printArrayValue(kvp: TokenStream.Token) void {
+//     var current = kvp.KeyValuePair.value;
+//     var ending_parens = 1;
+//     std.debug.print("[", .{});
+//     while (current == .array) {
+//             ending_parens += 1;
+//     }
+//     var count: usize = 0;
+//     while (count < ending_parens): {ending_parens += 1} {
+//         std.debug.print("]", .{});
+//     }
+//     std.debug.print("\n", .{});
+// }
 
 // https://github.com/ziglang/zig/issues/868
 fn isComptime() bool {
